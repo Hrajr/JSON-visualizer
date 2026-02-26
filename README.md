@@ -1,109 +1,77 @@
-# JSON TXT Visualizer
+# JSON Visualizer
 
-A VS Code extension for visualizing large `.txt` files containing concatenated JSON objects in a high-performance data table.
+A high-performance, client-side web application for visualizing large files containing concatenated JSON objects.
 
 ## Features
 
-- **Streaming Parser**: Handles files of hundreds of MB to multiple GB without loading everything into memory
-- **NDJSON Indexing**: Parsed objects are written to an indexed NDJSON temp file for fast random access
-- **Virtualized Table**: Only visible rows are rendered using `@tanstack/react-table` + `@tanstack/react-virtual`
-- **Column Management**: Auto-discovers columns from first 2000 records; toggle visibility and pin columns
-- **Search & Filter**: Global or column-specific search with contains/equals/regex modes; streams results progressively
-- **Go to Row**: Jump directly to any row number
-- **Copy Row JSON**: Copy any row's full JSON with one click
-- **Sort**: Click column headers to sort (within current page)
-- **Status Bar**: Shows current file name and record count
+- **Streaming file parsing** – Files are read in chunks using `File.stream()` and parsed in a Web Worker, keeping the UI responsive even for files with hundreds of thousands of records
+- **Robust JSON extraction** – Brace-counting parser that handles nested braces inside strings, escaped quotes, and whitespace between objects
+- **Virtual table** – Only visible rows are rendered, enabling smooth scrolling through massive datasets
+- **Dynamic columns** – Columns are derived from encountered keys, ordered by frequency; supports visibility toggling, pinning (up to 3), and reordering
+- **Debounced search** – Case-insensitive search runs in a dedicated Web Worker; shows match count and timing
+- **Row detail drawer** – Click any row to see its full key/value pairs and raw JSON
+- **Sample data generator** – Generate test files with configurable record count
+- **Keyboard shortcuts** – `Ctrl/Cmd+F` focuses search, `Esc` closes drawer
 
 ## Architecture
 
 ```
-Extension Host (TypeScript)          Webview (React + Vite)
-┌──────────────────────────┐        ┌──────────────────────────┐
-│ extension.ts             │        │ App.tsx                  │
-│ ├─ parser/               │◄──────►│ ├─ DataTable.tsx         │
-│ │  └─ streamJsonObjects  │  msg   │ ├─ SearchBar.tsx         │
-│ ├─ indexing/             │        │ ├─ Toolbar.tsx           │
-│ │  └─ ndjsonStore        │        │ ├─ ColumnSelector.tsx    │
-│ └─ webview/              │        │ └─ JsonModal.tsx         │
-│    └─ ViewerPanel        │        └──────────────────────────┘
-└──────────────────────────┘
+┌───────────────────────────────────────────────────┐
+│  Main Thread (Vue 3 + Reactive State)             │
+│                                                   │
+│  App.vue                                          │
+│  ├── FileLoader.vue    – file input / drag+drop   │
+│  ├── SearchBar.vue     – search input + stats     │
+│  ├── ColumnManager.vue – sidebar column controls  │
+│  ├── VirtualTable.vue  – virtualised data table   │
+│  └── RowDrawer.vue     – record detail drawer     │
+│                                                   │
+│  Composables:                                     │
+│  ├── useParser.ts      – parser worker lifecycle  │
+│  ├── useSearch.ts      – search worker lifecycle  │
+│  └── useColumns.ts     – column state management  │
+└──────────┬────────────────────┬───────────────────┘
+           │                    │
+     ┌─────▼─────┐      ┌──────▼──────┐
+     │  Parser    │      │  Search     │
+     │  Worker    │      │  Worker     │
+     │            │      │             │
+     │  Reads     │      │  Filters    │
+     │  file in   │      │  pre-built  │
+     │  chunks,   │      │  search     │
+     │  emits     │      │  strings    │
+     │  batches   │      │  by query   │
+     └────────────┘      └─────────────┘
 ```
 
-Communication uses `vscode.postMessage` / `onDidReceiveMessage` with TypeScript discriminated union message types defined in `src/shared/messages.ts`.
+### Key Performance Strategies
 
-## Usage
+1. **Web Workers** – Parsing and search run off the main thread
+2. **Batched messaging** – Records are sent in batches (default 200) to reduce postMessage overhead
+3. **Shallow reactivity** – `shallowRef` + `markRaw` prevent Vue from deeply observing large arrays of records
+4. **Row virtualisation** – Only ~30-50 rows are in the DOM at any time regardless of dataset size
+5. **Search string caching** – Lowercase search strings are built once during parsing and reused for every search
 
-1. Open VS Code with this extension installed
-2. Run command: **JSON TXT Visualizer: Open Viewer** (`Ctrl+Shift+P`)
-3. Click "Open File..." or it auto-detects the currently open `.txt` file
-4. Click "Parse & Load" to start streaming the file
-5. Browse data in the table, search, filter, and sort
-
-## Building
-
-### Prerequisites
-
-- Node.js 18+
-- npm
-
-### Install dependencies
+## Setup
 
 ```bash
-npm run install:all
+npm install
+npm run dev
 ```
 
-### Build everything
+Open `http://localhost:5174` in your browser.
+
+## Build for Production
 
 ```bash
 npm run build
-npm run build:webview
+npm run preview
 ```
 
-### Watch mode (extension only)
+## Tech Stack
 
-```bash
-npm run watch
-```
-
-### Run tests
-
-```bash
-npm run test:parser
-```
-
-### Debug in VS Code
-
-1. Open this folder in VS Code
-2. Press `F5` to launch the Extension Development Host
-3. In the new window, run `Ctrl+Shift+P` → "JSON TXT Visualizer: Open Viewer"
-
-## Performance Notes
-
-- **Streaming Parser**: Uses `fs.createReadStream` with configurable chunk size (default 1 MB). Tracks brace depth and string/escape state to detect JSON object boundaries across chunk boundaries.
-- **NDJSON Index**: Each parsed object is written as one line to a temporary NDJSON file. An in-memory array maps record index → byte offset for O(1) random access reads.
-- **Memory**: Only one page of rows (default 200) is held in memory at a time. The NDJSON file lives on disk.
-- **Search**: Scans the NDJSON file in batches of 500 records, sending partial results back to the UI progressively. Search can be cancelled mid-scan.
-- **UI**: The webview uses row virtualization — only visible rows are rendered to the DOM regardless of dataset size.
-
-## File Format
-
-The extension expects text files with concatenated JSON objects:
-
-```json
-{
-  "id": 1,
-  "name": "Alice",
-  "email": "alice@example.com"
-}
-{
-  "id": 2,
-  "name": "Bob",
-  "email": "bob@example.com"
-}
-```
-
-Objects can be pretty-printed or compact, separated by whitespace or nothing at all. The parser handles all these cases.
-
-## License
-
-MIT
+- Vue 3 + Composition API + TypeScript
+- Vite (dev server + bundler)
+- TailwindCSS (styling)
+- Web Workers (parsing + search)
+- No backend required – purely client-side

@@ -1,6 +1,4 @@
-out/
-node_modules/
-webview-ui/node_modules/
-webview-ui/dist/
-*.vsix
-.tmp/
+node_modules
+dist
+.vite
+*.local
