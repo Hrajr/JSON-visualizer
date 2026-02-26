@@ -1,0 +1,6 @@
+out/
+node_modules/
+webview-ui/node_modules/
+webview-ui/dist/
+*.vsix
+.tmp/
