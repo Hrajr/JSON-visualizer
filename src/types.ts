@@ -21,10 +21,9 @@ export interface ParseError {
   message: string
 }
 
-/** Metadata describing a loaded dataset (persisted to localStorage). */
+/** Metadata describing a loaded dataset (persisted server-side in SQLite). */
 export interface DatasetInfo {
   id: string
-  dbName: string
   fileName: string
   recordCount: number
   keys: string[]
@@ -35,7 +34,6 @@ export interface DatasetInfo {
 /** Offset range for a dataset in the combined multi-dataset view. */
 export interface DatasetRange {
   id: string
-  dbName: string
   offset: number
   count: number
 }
@@ -44,8 +42,8 @@ export interface DatasetRange {
 
 /** Messages sent TO the parser worker */
 export type ParserWorkerInMessage =
-  | { type: 'start'; file: File; batchSize: number; maxRecords: number; dbName: string }
-  | { type: 'start-url'; url: string; batchSize: number; maxRecords: number; dbName: string }
+  | { type: 'start'; file: File; batchSize: number; maxRecords: number; datasetId: string }
+  | { type: 'start-url'; url: string; batchSize: number; maxRecords: number; datasetId: string }
   | { type: 'cancel' }
 
 /** Messages sent FROM the parser worker */
@@ -57,19 +55,6 @@ export type ParserWorkerOutMessage =
   | { type: 'done'; totalRecords: number; totalErrors: number }
   | { type: 'cancelled' }
   | { type: 'limit-reached'; totalRecords: number }
-
-/** Messages sent TO the search worker */
-export type SearchWorkerInMessage =
-  | { type: 'search'; query: string; propertyFilter: string; datasets: DatasetRange[] }
-  | { type: 'sort'; column: string; direction: 'asc' | 'desc'; indices: number[] | null; datasets: DatasetRange[] }
-  | { type: 'cancel' }
-
-/** Messages sent FROM the search worker */
-export type SearchWorkerOutMessage =
-  | { type: 'result'; matchingIndices: number[] | null; timeTaken: number }
-  | { type: 'sort-result'; sortedIndices: number[]; timeTaken: number }
-  | { type: 'progress'; scanned: number }
-  | { type: 'cancelled' }
 
 /** Application state enum */
 export type AppState = 'idle' | 'loading' | 'loaded' | 'error'

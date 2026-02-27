@@ -2,15 +2,15 @@
  * Parser Web Worker
  *
  * Reads data from a File object OR a URL (fetch streaming).
- * Parses concatenated JSON objects and writes them DIRECTLY to IndexedDB
- * inside this worker – records never touch the main thread.
+ * Parses concatenated JSON objects and sends them to the server-side
+ * SQLite database via HTTP POST.
  *
  * Includes automatic JSON repair for common issues (trailing commas,
  * missing closing brackets, control characters).
  *
  * Messages IN:
- *   { type: 'start', file, batchSize, maxRecords, dbName }
- *   { type: 'start-url', url, batchSize, maxRecords, dbName }
+ *   { type: 'start', file, batchSize, maxRecords, datasetId }
+ *   { type: 'start-url', url, batchSize, maxRecords, datasetId }
  *   { type: 'cancel' }
  *
  * Messages OUT:
@@ -26,116 +26,23 @@
 import { extractJsonObjects } from '../utils/parser'
 import type { JsonRecord, ParseError } from '../types'
 
-const DB_VERSION = 1
-const RECORDS_STORE = 'records'
-const META_STORE = 'meta'
-
 let cancelled = false
-let db: IDBDatabase | null = null
-let currentDBName = ''
 
-// ── IndexedDB helpers ──
+// ── Server API helper ──
 
-function openWorkerDB(dbName: string): Promise<IDBDatabase> {
-  if (db && currentDBName === dbName) return Promise.resolve(db)
-  if (db) { db.close(); db = null }
-  currentDBName = dbName
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(dbName, DB_VERSION)
-    req.onupgradeneeded = () => {
-      const d = req.result
-      if (!d.objectStoreNames.contains(RECORDS_STORE)) d.createObjectStore(RECORDS_STORE)
-      if (!d.objectStoreNames.contains(META_STORE)) d.createObjectStore(META_STORE)
-    }
-    req.onsuccess = () => { db = req.result; resolve(db) }
-    req.onerror = () => reject(req.error)
-    req.onblocked = () => reject(new Error(`Worker IDB open blocked: ${dbName}`))
-  })
-}
-
-function closeWorkerDB(): void {
-  if (db) { db.close(); db = null; currentDBName = '' }
-}
-
-/** Delete ALL jv-ds-* databases except `keepName` to free IDB quota. */
-async function deleteOldJvDatabases(keepName: string): Promise<void> {
-  if (typeof indexedDB.databases !== 'function') return
-  try {
-    const allDBs = await indexedDB.databases()
-    for (const info of allDBs) {
-      if (info.name && info.name.startsWith('jv-ds-') && info.name !== keepName) {
-        await new Promise<void>(resolve => {
-          const req = indexedDB.deleteDatabase(info.name!)
-          req.onsuccess = () => resolve()
-          req.onerror = () => resolve()
-          req.onblocked = () => {
-            // Force-resolve after timeout; blocker is gone by now ideally
-            const t = setTimeout(resolve, 3000)
-            req.onsuccess = () => { clearTimeout(t); resolve() }
-          }
-        })
-      }
-    }
-  } catch { /* best effort */ }
-}
-
-function clearDB(dbName: string): Promise<void> {
-  return openWorkerDB(dbName).then(d => new Promise((resolve, reject) => {
-    const tx = d.transaction([RECORDS_STORE, META_STORE], 'readwrite')
-    tx.objectStore(RECORDS_STORE).clear()
-    tx.objectStore(META_STORE).clear()
-    tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error)
-  }))
-}
-
-function writeBatchDirect(
-  startIndex: number,
+async function postRecordsToServer(
+  datasetId: string,
   records: JsonRecord[],
-): Promise<void> {
-  if (!db) return Promise.reject(new Error('DB not open'))
-  const d = db
-  return new Promise((resolve, reject) => {
-    const tx = d.transaction(RECORDS_STORE, 'readwrite')
-    const store = tx.objectStore(RECORDS_STORE)
-    for (let i = 0; i < records.length; i++) {
-      store.put(records[i], startIndex + i)
-    }
-    tx.oncomplete = () => resolve()
-    tx.onerror = () => reject(tx.error)
-  })
-}
-
-/** Write batch with automatic retry using progressively smaller sub-batches on quota errors. */
-async function writeBatch(
   startIndex: number,
-  records: JsonRecord[],
 ): Promise<void> {
-  try {
-    await writeBatchDirect(startIndex, records)
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    const isQuota = msg.toLowerCase().includes('quota')
-    if (isQuota && records.length > 1) {
-      // Progressively halve the batch size until we're writing single records
-      const half = Math.max(1, Math.floor(records.length / 2))
-      for (let i = 0; i < records.length; i += half) {
-        const slice = records.slice(i, Math.min(i + half, records.length))
-        await writeBatch(startIndex + i, slice) // recursive – will keep halving on failure
-      }
-    } else if (isQuota && records.length === 1) {
-      // Even a single record exceeds quota – report non-fatal error and skip
-      self.postMessage({
-        type: 'error',
-        error: {
-          recordIndex: startIndex,
-          snippet: JSON.stringify(records[0]).substring(0, 200),
-          message: 'IDB quota exceeded – record skipped',
-        },
-      })
-    } else {
-      throw err
-    }
+  const res = await fetch(`/api/db/datasets/${datasetId}/records`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ records, startIndex }),
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`Server insert failed (${res.status}): ${text}`)
   }
 }
 
@@ -189,7 +96,7 @@ function tryRepairJson(jsonStr: string): JsonRecord | null {
 // ── Parse context ──
 
 interface ParseContext {
-  dbName: string
+  datasetId: string
   maxRecords: number
   totalBytes: number
   bytesRead: number
@@ -201,11 +108,12 @@ interface ParseContext {
   batchStartIndex: number
 }
 
-const IDB_FLUSH_SIZE = 50
+/** Flush batch size – send records to server in chunks of 500. */
+const FLUSH_SIZE = 500
 
-function createContext(dbName: string, maxRecords: number, totalBytes: number): ParseContext {
+function createContext(datasetId: string, maxRecords: number, totalBytes: number): ParseContext {
   return {
-    dbName,
+    datasetId,
     maxRecords,
     totalBytes,
     bytesRead: 0,
@@ -229,7 +137,7 @@ async function flushBatch(ctx: ParseContext): Promise<void> {
   ctx.batchRecords = []
   ctx.batchKeys = new Set()
 
-  await writeBatch(startIdx, records)
+  await postRecordsToServer(ctx.datasetId, records, startIdx)
 
   if (keys.length > 0) {
     self.postMessage({ type: 'keys', keys })
@@ -275,7 +183,7 @@ async function processChunk(ctx: ParseContext, chunk: string, chunkByteLength: n
       }
     }
 
-    if (ctx.batchRecords.length >= IDB_FLUSH_SIZE) {
+    if (ctx.batchRecords.length >= FLUSH_SIZE) {
       await flushBatch(ctx)
     }
   }
@@ -313,7 +221,6 @@ async function finalize(ctx: ParseContext) {
   }
 
   await flushBatch(ctx)
-  closeWorkerDB()
 
   self.postMessage({
     type: 'done',
@@ -324,25 +231,21 @@ async function finalize(ctx: ParseContext) {
 
 // ── Parse entry points ──
 
-async function parseFromFile(file: File, maxRecords: number, dbName: string) {
+async function parseFromFile(file: File, maxRecords: number, datasetId: string) {
   try {
-    // Delete any leftover databases from previous sessions to free IDB quota
-    await deleteOldJvDatabases(dbName)
-    await clearDB(dbName)
-    const ctx = createContext(dbName, maxRecords, file.size)
+    const ctx = createContext(datasetId, maxRecords, file.size)
 
     if (typeof file.stream === 'function') {
       const reader = file.stream().getReader()
       const decoder = new TextDecoder('utf-8')
       try {
         while (true) {
-          if (cancelled) { reader.cancel(); closeWorkerDB(); self.postMessage({ type: 'cancelled' }); return }
+          if (cancelled) { reader.cancel(); self.postMessage({ type: 'cancelled' }); return }
           const { done, value } = await reader.read()
           if (done) break
           if (await processChunk(ctx, decoder.decode(value, { stream: true }), value.byteLength)) return
         }
       } catch (err) {
-        closeWorkerDB()
         self.postMessage({ type: 'error', error: {
           recordIndex: -1, snippet: '',
           message: err instanceof Error ? err.message : String(err),
@@ -353,7 +256,7 @@ async function parseFromFile(file: File, maxRecords: number, dbName: string) {
       const CHUNK_SIZE = 2 * 1024 * 1024
       let offset = 0
       while (offset < file.size) {
-        if (cancelled) { closeWorkerDB(); self.postMessage({ type: 'cancelled' }); return }
+        if (cancelled) { self.postMessage({ type: 'cancelled' }); return }
         const end = Math.min(offset + CHUNK_SIZE, file.size)
         const text = await file.slice(offset, end).text()
         if (await processChunk(ctx, text, end - offset)) return
@@ -363,7 +266,6 @@ async function parseFromFile(file: File, maxRecords: number, dbName: string) {
 
     await finalize(ctx)
   } catch (err) {
-    closeWorkerDB()
     self.postMessage({ type: 'error', error: {
       recordIndex: -1, snippet: '',
       message: 'File parse failed: ' + (err instanceof Error ? err.message : String(err)),
@@ -371,11 +273,8 @@ async function parseFromFile(file: File, maxRecords: number, dbName: string) {
   }
 }
 
-async function parseFromUrl(url: string, maxRecords: number, dbName: string) {
+async function parseFromUrl(url: string, maxRecords: number, datasetId: string) {
   try {
-    // Delete any leftover databases from previous sessions to free IDB quota
-    await deleteOldJvDatabases(dbName)
-    await clearDB(dbName)
     const response = await fetch(url)
     if (!response.ok) {
       self.postMessage({ type: 'error', error: {
@@ -387,7 +286,7 @@ async function parseFromUrl(url: string, maxRecords: number, dbName: string) {
 
     const contentLength = response.headers.get('content-length')
     const totalBytesVal = contentLength ? parseInt(contentLength, 10) : 0
-    const ctx = createContext(dbName, maxRecords, totalBytesVal)
+    const ctx = createContext(datasetId, maxRecords, totalBytesVal)
 
     if (!response.body) {
       const text = await response.text()
@@ -400,7 +299,7 @@ async function parseFromUrl(url: string, maxRecords: number, dbName: string) {
     const decoder = new TextDecoder('utf-8')
 
     while (true) {
-      if (cancelled) { reader.cancel(); closeWorkerDB(); self.postMessage({ type: 'cancelled' }); return }
+      if (cancelled) { reader.cancel(); self.postMessage({ type: 'cancelled' }); return }
       const { done, value } = await reader.read()
       if (done) break
       if (await processChunk(ctx, decoder.decode(value, { stream: true }), value.byteLength)) {
@@ -410,7 +309,6 @@ async function parseFromUrl(url: string, maxRecords: number, dbName: string) {
 
     await finalize(ctx)
   } catch (err) {
-    closeWorkerDB()
     self.postMessage({ type: 'error', error: {
       recordIndex: -1, snippet: '',
       message: err instanceof Error ? err.message : String(err),
@@ -429,15 +327,14 @@ self.onmessage = async (e: MessageEvent) => {
   try {
     if (msg.type === 'start') {
       cancelled = false
-      await parseFromFile(msg.file, msg.maxRecords || 0, msg.dbName)
+      await parseFromFile(msg.file, msg.maxRecords || 0, msg.datasetId)
     }
 
     if (msg.type === 'start-url') {
       cancelled = false
-      await parseFromUrl(msg.url, msg.maxRecords || 0, msg.dbName)
+      await parseFromUrl(msg.url, msg.maxRecords || 0, msg.datasetId)
     }
   } catch (err) {
-    closeWorkerDB()
     self.postMessage({ type: 'error', error: {
       recordIndex: -1, snippet: '',
       message: 'Worker error: ' + (err instanceof Error ? err.message : String(err)),

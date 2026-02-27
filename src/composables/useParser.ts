@@ -1,14 +1,14 @@
 /**
  * useParser – manages the parser worker lifecycle.
  *
- * Each load creates a new dataset with its own IndexedDB database.
- * The worker writes directly to IndexedDB – no records on the main thread.
+ * Each load creates a new dataset with its own server-side SQLite database.
+ * The worker parses the file and POSTs records to the server via HTTP.
  * On completion, calls the registered callback with DatasetInfo.
  */
 
 import { ref, shallowRef, computed, type Ref } from 'vue'
 import type { ParseError, AppState, DatasetInfo } from '../types'
-import { generateDatasetId, dbNameForDataset, closeNamedDB } from '../utils/db'
+import { generateDatasetId, createServerDataset, finalizeServerDataset } from '../utils/db'
 import ParserWorker from '../workers/parser.worker?worker'
 
 /** Default max records to load (0 = unlimited) */
@@ -26,10 +26,10 @@ export function useParser() {
   const fileName = ref('')
   const limitReached = ref(false)
   const maxRecords = ref(DEFAULT_MAX_RECORDS)
-  const currentDbName = ref('')
+  const currentDatasetId = ref('')
 
   let worker: Worker | null = null
-  let currentDatasetId = ''
+  let _currentDatasetId = ''
 
   /** Called when parsing completes successfully. */
   let onCompleteCallback: ((info: DatasetInfo) => void) | null = null
@@ -41,8 +41,7 @@ export function useParser() {
 
   function buildDatasetInfo(totalRecords: number): DatasetInfo {
     return {
-      id: currentDatasetId,
-      dbName: currentDbName.value,
+      id: _currentDatasetId,
       fileName: fileName.value,
       recordCount: totalRecords,
       keys: Array.from(allKeys.value.keys()),
@@ -55,7 +54,7 @@ export function useParser() {
     if (worker) worker.terminate()
     worker = new ParserWorker()
 
-    worker.onmessage = (e: MessageEvent) => {
+    worker.onmessage = async (e: MessageEvent) => {
       const msg = e.data
 
       switch (msg.type) {
@@ -91,7 +90,15 @@ export function useParser() {
           recordsParsed.value = msg.totalRecords
           dbRecordCount.value = msg.totalRecords
           try {
-            if (onCompleteCallback) onCompleteCallback(buildDatasetInfo(msg.totalRecords))
+            const info = buildDatasetInfo(msg.totalRecords)
+            // Finalize dataset on server with final count and keys
+            await finalizeServerDataset(
+              _currentDatasetId,
+              info.recordCount,
+              info.keys,
+              info.totalBytes,
+            )
+            if (onCompleteCallback) onCompleteCallback(info)
           } catch (err) {
             console.error('onComplete callback error:', err)
             state.value = 'error'
@@ -105,7 +112,14 @@ export function useParser() {
           recordsParsed.value = msg.totalRecords
           dbRecordCount.value = msg.totalRecords
           try {
-            if (onCompleteCallback) onCompleteCallback(buildDatasetInfo(msg.totalRecords))
+            const info = buildDatasetInfo(msg.totalRecords)
+            await finalizeServerDataset(
+              _currentDatasetId,
+              info.recordCount,
+              info.keys,
+              info.totalBytes,
+            )
+            if (onCompleteCallback) onCompleteCallback(info)
           } catch (err) {
             console.error('onComplete callback error:', err)
             state.value = 'error'
@@ -115,7 +129,6 @@ export function useParser() {
 
         case 'cancelled':
           state.value = 'idle'
-          closeNamedDB(currentDbName.value)
           break
       }
     }
@@ -137,13 +150,16 @@ export function useParser() {
     state.value = 'loading'
   }
 
-  function startParsing(file: File, batchSize = 200) {
-    currentDatasetId = generateDatasetId()
-    currentDbName.value = dbNameForDataset(currentDatasetId)
+  async function startParsing(file: File, batchSize = 200) {
+    _currentDatasetId = generateDatasetId()
+    currentDatasetId.value = _currentDatasetId
 
     resetState()
     totalBytes.value = file.size
     fileName.value = file.name
+
+    // Create dataset on server before starting the worker
+    await createServerDataset(_currentDatasetId, file.name, file.size)
 
     setupWorker()
     worker!.postMessage({
@@ -151,16 +167,19 @@ export function useParser() {
       file,
       batchSize,
       maxRecords: maxRecords.value,
-      dbName: currentDbName.value,
+      datasetId: _currentDatasetId,
     })
   }
 
-  function startParsingUrl(url: string, displayName: string, batchSize = 200) {
-    currentDatasetId = generateDatasetId()
-    currentDbName.value = dbNameForDataset(currentDatasetId)
+  async function startParsingUrl(url: string, displayName: string, batchSize = 200) {
+    _currentDatasetId = generateDatasetId()
+    currentDatasetId.value = _currentDatasetId
 
     resetState()
     fileName.value = displayName
+
+    // Create dataset on server before starting the worker
+    await createServerDataset(_currentDatasetId, displayName, 0)
 
     setupWorker()
     worker!.postMessage({
@@ -168,7 +187,7 @@ export function useParser() {
       url,
       batchSize,
       maxRecords: maxRecords.value,
-      dbName: currentDbName.value,
+      datasetId: _currentDatasetId,
     })
   }
 
@@ -187,8 +206,8 @@ export function useParser() {
     dbRecordCount.value = 0
     fileName.value = ''
     limitReached.value = false
-    currentDatasetId = ''
-    currentDbName.value = ''
+    _currentDatasetId = ''
+    currentDatasetId.value = ''
   }
 
   function onComplete(cb: (info: DatasetInfo) => void) {
@@ -207,7 +226,7 @@ export function useParser() {
     fileName,
     limitReached,
     maxRecords,
-    currentDbName,
+    currentDatasetId,
     startParsing,
     startParsingUrl,
     cancelParsing,

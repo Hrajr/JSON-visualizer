@@ -1,19 +1,17 @@
 /**
  * useDatasets – composable for managing multiple persistent datasets.
  *
- * Each dataset is stored in its own IndexedDB database.
- * Metadata is persisted to localStorage so datasets survive page reloads.
- * Supports multi-select: selecting multiple datasets combines their records.
+ * Each dataset is stored in a server-side SQLite database.
+ * Metadata is fetched from the server API. Active dataset IDs are
+ * stored in localStorage as a browser-local UI preference.
  */
 
 import { ref, computed, type Ref } from 'vue'
 import type { DatasetInfo, DatasetRange, JsonRecord } from '../types'
 import {
-  getSavedDatasets, saveDatasetInfo, removeDatasetInfo,
-  getSavedActiveIds, saveActiveIds,
-  deleteNamedDB, deleteAllJvDatabases, computeRanges,
+  fetchDatasets, deleteServerDataset, deleteAllServerDatasets,
+  getSavedActiveIds, saveActiveIds, computeRanges,
   getRecordByAbsoluteIndex, getRecordsByAbsoluteIndices,
-  getExistingJvDatabaseNames,
 } from '../utils/db'
 
 export function useDatasets() {
@@ -44,28 +42,16 @@ export function useDatasets() {
     return keyMap
   })
 
-  /** Load state from localStorage. Validates IDB databases still exist. */
+  /** Load state from server. */
   async function init() {
-    datasets.value = getSavedDatasets()
+    try {
+      datasets.value = await fetchDatasets()
+    } catch (err) {
+      console.error('[Datasets] Failed to fetch datasets from server:', err)
+      datasets.value = []
+    }
     const saved = getSavedActiveIds()
     activeIds.value = saved.filter(id => datasets.value.some(d => d.id === id))
-
-    // Validate that IDB databases actually exist (may have been evicted by browser)
-    try {
-      const existingNames = await getExistingJvDatabaseNames()
-      if (existingNames.size > 0 || datasets.value.length > 0) {
-        const validDatasets = datasets.value.filter(ds => existingNames.has(ds.dbName))
-        if (validDatasets.length !== datasets.value.length) {
-          // Some databases were evicted – clean up metadata
-          datasets.value = validDatasets
-          localStorage.setItem('jv-datasets', JSON.stringify(validDatasets))
-          activeIds.value = activeIds.value.filter(id => validDatasets.some(d => d.id === id))
-          saveActiveIds(activeIds.value)
-        }
-      }
-    } catch {
-      // If databases() API fails, trust localStorage
-    }
   }
 
   /**
@@ -73,9 +59,16 @@ export function useDatasets() {
    * @param activate If true (default), makes it the only active dataset.
    *                 If false, registers it without changing active selection.
    */
-  function addDataset(info: DatasetInfo, activate = true) {
-    saveDatasetInfo(info)
-    datasets.value = getSavedDatasets()
+  async function addDataset(info: DatasetInfo, activate = true) {
+    // Refresh dataset list from server (the dataset was just finalized there)
+    try {
+      datasets.value = await fetchDatasets()
+    } catch {
+      // Fallback: add locally
+      const existing = datasets.value.findIndex(d => d.id === info.id)
+      if (existing >= 0) datasets.value[existing] = info
+      else datasets.value = [...datasets.value, info]
+    }
     if (activate) {
       activeIds.value = [info.id]
       saveActiveIds(activeIds.value)
@@ -104,32 +97,28 @@ export function useDatasets() {
     saveActiveIds(activeIds.value)
   }
 
-  /** Delete ALL datasets and their IDB databases. Frees storage quota.
-   *  Uses indexedDB.databases() to also delete orphaned databases not tracked in localStorage. */
+  /** Delete ALL datasets and their SQLite databases. */
   async function clearAllDatasets() {
-    // CRITICAL: Clear reactive state FIRST so the table stops fetching data.
-    // Otherwise Vue watchers re-open IDB connections during deletion, blocking it.
-    const toCleanMeta = [...datasets.value]
     datasets.value = []
     activeIds.value = []
     saveActiveIds([])
-    for (const ds of toCleanMeta) removeDatasetInfo(ds.id)
 
-    // Now that no reactive code is accessing databases, delete them all.
-    // Uses indexedDB.databases() to also catch orphaned databases.
-    await deleteAllJvDatabases()
+    try {
+      await deleteAllServerDatasets()
+    } catch (err) {
+      console.error('[Datasets] Failed to delete all datasets:', err)
+    }
   }
 
-  /** Delete a dataset (removes IDB + metadata). */
+  /** Delete a dataset (removes SQLite DB + metadata). */
   async function removeDataset(id: string) {
-    const ds = datasets.value.find(d => d.id === id)
-    if (ds) {
-      try { await deleteNamedDB(ds.dbName) } catch { /* best effort */ }
-      removeDatasetInfo(id)
-      datasets.value = getSavedDatasets()
-      activeIds.value = activeIds.value.filter(i => i !== id)
-      saveActiveIds(activeIds.value)
-    }
+    try {
+      await deleteServerDataset(id)
+    } catch { /* best effort */ }
+
+    datasets.value = datasets.value.filter(d => d.id !== id)
+    activeIds.value = activeIds.value.filter(i => i !== id)
+    saveActiveIds(activeIds.value)
   }
 
   async function getRecord(absIndex: number): Promise<JsonRecord | undefined> {

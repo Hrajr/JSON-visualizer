@@ -2,12 +2,12 @@
 /**
  * PaginatedTable – table with pagination for large datasets.
  *
- * Records are loaded from IndexedDB on demand via multi-dataset
+ * Records are loaded from server-side SQLite on demand via multi-dataset
  * absolute indexing. Only the current page's rows are in memory.
  *
  * Supports sortable column headers: click to cycle asc → desc → none.
  */
-import { ref, shallowRef, computed, watch, onMounted } from 'vue'
+import { ref, shallowRef, computed, watch, onMounted, reactive } from 'vue'
 import type { JsonRecord, ColumnDef, DatasetRange } from '../types'
 import { formatColumnName } from '../utils/format'
 import { getRecordsByAbsoluteIndices } from '../utils/db'
@@ -77,7 +77,7 @@ const pageRows = computed(() => {
   return rows
 })
 
-// ── Async page records from IndexedDB ──
+// ── Async page records from server ──
 const pageRecords = shallowRef<Map<number, JsonRecord>>(new Map())
 const isPageLoading = ref(false)
 let loadGeneration = 0
@@ -189,6 +189,48 @@ function onColDragEnd() { dragSourceKey.value = ''; dragOverKey.value = '' }
 
 const startRecord = computed(() => (currentPage.value - 1) * pageSize.value + 1)
 const endRecord = computed(() => Math.min(currentPage.value * pageSize.value, totalRows.value))
+
+// ── Column resize ──
+const DEFAULT_COL_WIDTH = 180
+const MIN_COL_WIDTH = 60
+const columnWidths = reactive<Record<string, number>>({})
+
+function getColWidth(key: string): number {
+  return columnWidths[key] ?? DEFAULT_COL_WIDTH
+}
+
+const isResizingColumn = ref(false)
+
+function onResizeStart(e: MouseEvent, key: string) {
+  e.preventDefault()
+  e.stopPropagation()
+  isResizingColumn.value = true
+  const startX = e.clientX
+  const startWidth = getColWidth(key)
+
+  function onMouseMove(ev: MouseEvent) {
+    const dx = ev.clientX - startX
+    columnWidths[key] = Math.max(MIN_COL_WIDTH, startWidth + dx)
+  }
+  function onMouseUp() {
+    isResizingColumn.value = false
+    document.removeEventListener('mousemove', onMouseMove)
+    document.removeEventListener('mouseup', onMouseUp)
+  }
+  document.addEventListener('mousemove', onMouseMove)
+  document.addEventListener('mouseup', onMouseUp)
+}
+
+function pinnedLeft(col: ColumnDef): number {
+  let left = 64 // row-number column width
+  for (const c of props.columns) {
+    if (c.key === col.key) break
+    if (c.pinned && c.order < col.order) {
+      left += getColWidth(c.key)
+    }
+  }
+  return left
+}
 </script>
 
 <template>
@@ -230,18 +272,18 @@ const endRecord = computed(() => Math.min(currentPage.value * pageSize.value, to
               v-for="col in columns"
               :key="col.key"
               draggable="true"
-              class="px-3 py-2 text-[10px] font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider border-b border-r border-gray-200/60 dark:border-gray-700/60 bg-gray-50 dark:bg-gray-800/80 text-left cell-truncate cursor-pointer select-none hover:bg-gray-100 dark:hover:bg-gray-700/60 transition-colors"
+              class="relative px-3 py-2 text-[10px] font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider border-b border-r border-gray-200/60 dark:border-gray-700/60 bg-gray-50 dark:bg-gray-800/80 text-left cell-truncate cursor-pointer select-none hover:bg-gray-100 dark:hover:bg-gray-700/60 transition-colors group/th"
               :class="[
                 col.pinned ? 'sticky z-30' : '',
                 dragOverKey === col.key ? 'ring-2 ring-blue-400 ring-inset' : '',
               ]"
               :style="{
-                width: '180px',
-                minWidth: '180px',
-                maxWidth: '180px',
-                ...(col.pinned ? { left: `${64 + columns.filter(c => c.pinned && c.order < col.order).length * 180}px` } : {}),
+                width: getColWidth(col.key) + 'px',
+                minWidth: getColWidth(col.key) + 'px',
+                maxWidth: getColWidth(col.key) + 'px',
+                ...(col.pinned ? { left: pinnedLeft(col) + 'px' } : {}),
               }"
-              :title="`Click to sort \u00b7 Drag to reorder`"
+              :title="`Click to sort · Drag to reorder`"
               @click="onHeaderClick(col.key)"
               @dragstart="onColDragStart($event, col.key)"
               @dragover.prevent="onColDragOver(col.key)"
@@ -257,6 +299,14 @@ const endRecord = computed(() => Math.min(currentPage.value * pageSize.value, to
                 >
                   {{ sortDirection === 'asc' ? '▲' : '▼' }}
                 </span>
+              </div>
+              <!-- Resize handle -->
+              <div
+                class="absolute top-0 right-0 w-[5px] h-full cursor-col-resize z-40 opacity-0 group-hover/th:opacity-100 hover:!opacity-100 transition-opacity"
+                :class="isResizingColumn ? '!opacity-100' : ''"
+                @mousedown="onResizeStart($event, col.key)"
+              >
+                <div class="w-[2px] h-full mx-auto bg-blue-400/60 dark:bg-blue-500/60"></div>
               </div>
             </th>
           </tr>
@@ -279,10 +329,10 @@ const endRecord = computed(() => Math.min(currentPage.value * pageSize.value, to
               class="px-3 py-1.5 text-[13px] border-r border-gray-100/60 dark:border-gray-800/40 bg-white dark:bg-gray-900"
               :class="col.pinned ? 'sticky z-10' : ''"
               :style="{
-                width: '180px',
-                minWidth: '180px',
-                maxWidth: '180px',
-                ...(col.pinned ? { left: `${64 + columns.filter(c => c.pinned && c.order < col.order).length * 180}px` } : {}),
+                width: getColWidth(col.key) + 'px',
+                minWidth: getColWidth(col.key) + 'px',
+                maxWidth: getColWidth(col.key) + 'px',
+                ...(col.pinned ? { left: pinnedLeft(col) + 'px' } : {}),
               }"
             >
               <span

@@ -6,12 +6,12 @@
  * RowDrawer, LoadingFooter, DatasetManager.
  *
  * Architecture:
- *   - useParser: manages file parsing into a new dataset (IndexedDB)
+ *   - useParser: manages file parsing into a new dataset (SQLite)
  *   - useDatasets: manages persistence, multi-dataset selection
  *   - useSearch: search + sort across active datasets
  *   - useColumns: column visibility / order / pinning
  *
- * On page reload, datasets are restored from localStorage + IndexedDB.
+ * On page reload, datasets are restored from server-side SQLite.
  */
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import FileLoader from './components/FileLoader.vue'
@@ -29,7 +29,7 @@ import { useSearch } from './composables/useSearch'
 import { useColumns } from './composables/useColumns'
 import { useTheme } from './composables/useTheme'
 import { formatColumnName } from './utils/format'
-import { getRecordFromDB, requestPersistentStorage, estimateStorage } from './utils/db'
+import { getRecordFromServer } from './utils/db'
 import type { JsonRecord, DatasetRange } from './types'
 
 // ── Theme ──
@@ -49,7 +49,7 @@ const {
   bytesRead, totalBytes, recordsParsed, dbRecordCount, progress,
   fileName: parserFileName,
   limitReached, maxRecords,
-  currentDbName,
+  currentDatasetId,
   startParsing, startParsingUrl, cancelParsing,
   reset: resetParser,
   onComplete: onParserComplete,
@@ -88,7 +88,7 @@ const displayKeys = computed(() => {
 const effectiveRanges = computed<DatasetRange[]>(() => {
   if (viewMode.value === 'loading') {
     return dbRecordCount.value > 0
-      ? [{ id: 'loading', dbName: currentDbName.value, offset: 0, count: dbRecordCount.value }]
+      ? [{ id: currentDatasetId.value || 'loading', offset: 0, count: dbRecordCount.value }]
       : []
   }
   return datasetRanges.value
@@ -125,7 +125,6 @@ const {
   setSort,
   resetSort,
   dispose: disposeSearch,
-  closeAllWorkerDBs,
 } = useSearch(displayRecordCount, effectiveRanges)
 
 // ── Row drawer ──
@@ -144,8 +143,8 @@ async function onSelectRow(index: number) {
   selectedRecord.value = null
 
   if (viewMode.value === 'loading') {
-    // During loading, use the single loading DB
-    const rec = await getRecordFromDB(currentDbName.value, index)
+    // During loading, fetch from the current dataset being loaded
+    const rec = await getRecordFromServer(currentDatasetId.value, index)
     selectedRecord.value = rec ?? null
   } else {
     const rec = await getDatasetRecord(index)
@@ -240,14 +239,9 @@ async function onLoadFile(file: File) {
   propertyFilters.value = []
   resetSort()
 
-  // Terminate workers & delete ALL old databases (including orphans)
+  // Terminate workers & delete ALL old datasets
   resetParser()
-  await closeAllWorkerDBs()
   await clearAllDatasets()
-
-  // Log storage state after cleanup
-  const est2 = await estimateStorage()
-  if (est2) console.log(`[JV] Storage after cleanup: ${(est2.usage / 1e6).toFixed(1)} MB used / ${(est2.quota / 1e6).toFixed(0)} MB quota`)
 
   urlQueue.value = []
   batchLoadedIds.value = []
@@ -266,14 +260,9 @@ async function onLoadUrls(files: { url: string; name: string }[]) {
   propertyFilters.value = []
   resetSort()
 
-  // Terminate workers & delete ALL old databases (including orphans)
+  // Terminate workers & delete ALL old datasets
   resetParser()
-  await closeAllWorkerDBs()
   await clearAllDatasets()
-
-  // Log storage state after cleanup
-  const est = await estimateStorage()
-  if (est) console.log(`[JV] Storage after cleanup: ${(est.usage / 1e6).toFixed(1)} MB used / ${(est.quota / 1e6).toFixed(0)} MB quota`)
 
   // Queue all files, start the first one
   const [first, ...rest] = files
@@ -374,16 +363,7 @@ function onKeydown(e: KeyboardEvent) {
 onMounted(async () => {
   window.addEventListener('keydown', onKeydown)
 
-  // Request persistent storage to avoid Firefox 2GB IDB quota limit
-  requestPersistentStorage().then(granted => {
-    if (granted) console.log('[JV] Persistent storage granted')
-    else console.warn('[JV] Persistent storage denied – large files may hit quota limits')
-  })
-  estimateStorage().then(est => {
-    if (est) console.log(`[JV] Storage: ${(est.usage / 1e6).toFixed(1)} MB used / ${(est.quota / 1e6).toFixed(0)} MB quota`)
-  })
-
-  // Restore persisted datasets (async: validates IDB databases still exist)
+  // Restore persisted datasets from server-side SQLite
   await initDatasets()
   if (activeDatasets.value.length > 0) {
     viewMode.value = 'viewing'
@@ -464,7 +444,7 @@ onBeforeUnmount(() => {
             :title="sidebarOpen ? 'Hide column panel' : 'Show column panel'"
             @click="sidebarOpen = !sidebarOpen"
           >
-            <svg class="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <svg class="w-[18px] h-[18px]" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
               <path stroke-linecap="round" stroke-linejoin="round" d="M3 4h18M3 8h18M3 12h18M3 16h12M3 20h8" />
             </svg>
           </button>
@@ -475,10 +455,10 @@ onBeforeUnmount(() => {
             :title="isDark ? 'Switch to light mode' : 'Switch to dark mode'"
             @click="toggleTheme"
           >
-            <svg v-if="isDark" class="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <svg v-if="isDark" class="w-[18px] h-[18px]" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
               <path stroke-linecap="round" stroke-linejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
             </svg>
-            <svg v-else class="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <svg v-else class="w-[18px] h-[18px]" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
               <path stroke-linecap="round" stroke-linejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
             </svg>
           </button>

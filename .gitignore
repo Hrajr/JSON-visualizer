@@ -10,3 +10,6 @@ build-output.txt
 # Data files (can be multi-GB)
 public/data/*
 !public/data/.gitkeep
+
+# SQLite databases (server-side storage)
+data/databases/
