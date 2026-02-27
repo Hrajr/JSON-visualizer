@@ -116,12 +116,17 @@ export function useColumns(allKeys: Ref<Map<string, number>>) {
   function togglePin(key: string) {
     const col = columns.value.find((c) => c.key === key)
     if (col) {
-      // Limit pinning to 3
-      const pinnedCount = columns.value.filter((c) => c.pinned).length
-      if (!col.pinned && pinnedCount >= 3) return
       col.pinned = !col.pinned
       if (col.pinned) col.visible = true
-      columns.value = [...columns.value]
+
+      // Re-sort so pinned columns move to the top, preserving relative order
+      const newCols = [...columns.value]
+      newCols.sort((a, b) => {
+        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1
+        return a.order - b.order
+      })
+      newCols.forEach((c, i) => (c.order = i))
+      columns.value = newCols
       savePrefs(columns.value)
     }
   }

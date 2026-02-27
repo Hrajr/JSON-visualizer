@@ -244,16 +244,16 @@ function pinnedLeft(col: ColumnDef): number {
           <tr
             v-for="row in records"
             :key="row.absIndex"
-            class="border-b border-gray-100/80 dark:border-gray-800/60 hover:bg-blue-50/60 dark:hover:bg-blue-950/30 cursor-pointer transition-colors"
+            class="group/row border-b border-gray-100/80 dark:border-gray-800/60 cursor-pointer transition-colors"
             @click="emit('select-row', row.absIndex)"
           >
-            <td class="shrink-0 w-16 px-3 py-1.5 text-[11px] font-mono text-gray-400/80 dark:text-gray-500/80 border-r border-gray-100/60 dark:border-gray-800/40 bg-white dark:bg-gray-900 sticky left-0 z-10 text-right tabular-nums select-none">
+            <td class="shrink-0 w-16 px-3 py-1.5 text-[11px] font-mono text-gray-400/80 dark:text-gray-500/80 border-r border-gray-100/60 dark:border-gray-800/40 bg-white dark:bg-gray-900 group-hover/row:bg-blue-50/60 dark:group-hover/row:bg-blue-950/30 sticky left-0 z-10 text-right tabular-nums select-none transition-colors">
               {{ row.absIndex + 1 }}
             </td>
             <td
               v-for="col in columns"
               :key="col.key"
-              class="px-3 py-1.5 text-[13px] border-r border-gray-100/60 dark:border-gray-800/40 bg-white dark:bg-gray-900"
+              class="px-3 py-1.5 text-[13px] border-r border-gray-100/60 dark:border-gray-800/40 bg-white dark:bg-gray-900 group-hover/row:bg-blue-50/60 dark:group-hover/row:bg-blue-950/30 transition-colors"
               :class="col.pinned ? 'sticky z-10' : ''"
               :style="{
                 width: getColWidth(col.key) + 'px',

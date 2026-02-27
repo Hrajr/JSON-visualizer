@@ -44,7 +44,7 @@
 
   /* Subtle table row stripe pattern */
   .table-striped tbody tr:nth-child(even) td {
-    @apply bg-gray-50/50 dark:bg-gray-800/20;
+    @apply bg-gray-50/60 dark:bg-gray-800/30;
   }
   .table-striped tbody tr:nth-child(even):hover td {
     @apply bg-blue-50/60 dark:bg-blue-950/30;
