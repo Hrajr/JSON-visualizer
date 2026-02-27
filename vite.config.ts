@@ -184,6 +184,25 @@ function sqliteApiPlugin(): Plugin {
             return
           }
 
+          // ── POST /api/db/query (server-side paginated query)
+          if (pathname === '/api/db/query' && req.method === 'POST') {
+            const body = (await parseJsonBody(req)) as {
+              datasets: { id: string; offset: number; count: number }[]
+              query: string
+              propertyFilters: string[]
+              sortColumn: string
+              sortDirection: 'asc' | 'desc'
+              page: number
+              pageSize: number
+            }
+            const result = db.queryRecords(
+              body.datasets, body.query, body.propertyFilters,
+              body.sortColumn, body.sortDirection, body.page, body.pageSize,
+            )
+            sendJson(res, result)
+            return
+          }
+
           // Unknown route
           sendJson(res, { error: 'Not found' }, 404)
         } catch (err) {

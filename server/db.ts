@@ -424,14 +424,13 @@ export function searchRecords(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='records_fts'",
       ).get()
 
-      // Build property-filter conditions (same for both paths)
+      // Build property-filter conditions — single json_extract call per property.
+      // IFNULL handles both missing keys (SQL NULL) and JSON null values.
       const propConditions: string[] = []
       const propParams: unknown[] = []
       for (const prop of propertyFilters) {
-        propConditions.push(
-          `json_extract(data, ?) IS NOT NULL AND json_extract(data, ?) != '' AND json_extract(data, ?) != 'null'`,
-        )
-        propParams.push(`$.${prop}`, `$.${prop}`, `$.${prop}`)
+        propConditions.push(`IFNULL(json_extract(data, ?), '') != ''`)
+        propParams.push(`$.${prop}`)
       }
 
       let rows: { idx: number }[]
@@ -577,4 +576,218 @@ export function getRecordCount(id: string): number {
   } catch {
     return 0
   }
+}
+
+// ── Server-side paginated query ──
+
+export interface QueryResult {
+  totalCount: number
+  records: { absIndex: number; data: Record<string, unknown> }[]
+  timeTaken: number
+}
+
+/**
+ * Build WHERE clause components from search terms and property filters.
+ * Returns { conditions, params, ftsQuery } for use in SQL construction.
+ */
+function buildWhereClause(
+  dbInstance: Database.Database,
+  terms: string[],
+  propertyFilters: string[],
+): {
+  conditions: string[]
+  params: unknown[]
+  ftsQuery: string | null
+  hasFts: boolean
+} {
+  const hasFts = !!dbInstance.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='records_fts'",
+  ).get()
+
+  const conditions: string[] = []
+  const params: unknown[] = []
+  let ftsQuery: string | null = null
+
+  // Search terms
+  if (terms.length > 0 && hasFts) {
+    ftsQuery = terms.map(escapeFtsTerm).join(' ')
+    conditions.push('idx IN (SELECT rowid FROM records_fts WHERE records_fts MATCH ?)')
+    params.push(ftsQuery)
+  } else if (terms.length > 0) {
+    for (const term of terms) {
+      conditions.push('search_text LIKE ?')
+      params.push(`%${term}%`)
+    }
+  }
+
+  // Property filters
+  for (const prop of propertyFilters) {
+    conditions.push(`IFNULL(json_extract(data, ?), '') != ''`)
+    params.push(`$.${prop}`)
+  }
+
+  return { conditions, params, ftsQuery, hasFts }
+}
+
+/**
+ * Server-side paginated query — search + filter + sort + LIMIT/OFFSET.
+ *
+ * Returns only the records for the requested page plus the total count of
+ * matching records. No huge index arrays are ever sent to the client.
+ *
+ * Handles multi-dataset by querying each dataset, merging and paginating
+ * the combined results.
+ */
+export function queryRecords(
+  datasets: { id: string; offset: number; count: number }[],
+  query: string,
+  propertyFilters: string[],
+  sortColumn: string,
+  sortDirection: 'asc' | 'desc',
+  page: number,
+  pageSize: number,
+): QueryResult {
+  const start = performance.now()
+  const trimmedQuery = query.trim().toLowerCase()
+  const terms = trimmedQuery
+    ? trimmedQuery.split(',').map(t => t.trim()).filter(Boolean)
+    : []
+
+  const hasFilter = terms.length > 0 || propertyFilters.length > 0
+  const hasSort = sortColumn !== ''
+
+  // ── Single dataset fast path (most common) ──
+  if (datasets.length === 1) {
+    const ds = datasets[0]
+    try {
+      const db = getDB(ds.id)
+      const { conditions, params } = buildWhereClause(db, terms, propertyFilters)
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+
+      // Count matching records — skip expensive COUNT(*) when no filter
+      let totalCount: number
+      if (!hasFilter) {
+        totalCount = ds.count
+      } else {
+        const countRow = db.prepare(
+          `SELECT COUNT(*) as cnt FROM records ${where}`,
+        ).get(...params) as { cnt: number }
+        totalCount = countRow.cnt
+      }
+
+      // Build ORDER BY
+      let orderBy = 'ORDER BY idx'
+      const orderParams: unknown[] = []
+      if (hasSort) {
+        orderBy = `ORDER BY json_extract(data, ?) ${sortDirection === 'desc' ? 'DESC' : 'ASC'}, idx`
+        orderParams.push(`$.${sortColumn}`)
+      }
+
+      // Fetch page
+      const offset = (page - 1) * pageSize
+      const rows = db.prepare(
+        `SELECT idx, data FROM records ${where} ${orderBy} LIMIT ? OFFSET ?`,
+      ).all(...params, ...orderParams, pageSize, offset) as { idx: number; data: string }[]
+
+      const records = rows.map(row => ({
+        absIndex: row.idx + ds.offset,
+        data: JSON.parse(row.data) as Record<string, unknown>,
+      }))
+
+      return { totalCount, records, timeTaken: performance.now() - start }
+    } catch (err) {
+      console.error(`[SQLite] Query error on dataset ${ds.id}:`, err)
+      return { totalCount: 0, records: [], timeTaken: performance.now() - start }
+    }
+  }
+
+  // ── Multi-dataset path ──
+  // Collect all matching records across datasets, then sort & paginate in JS
+  const allRecords: { absIndex: number; data: Record<string, unknown>; sortVal?: unknown }[] = []
+  // When no filter is active, total is the sum of dataset sizes — skip COUNT(*)
+  let totalCount = hasFilter ? 0 : datasets.reduce((s, d) => s + d.count, 0)
+
+  for (const ds of datasets) {
+    try {
+      const db = getDB(ds.id)
+      const { conditions, params } = buildWhereClause(db, terms, propertyFilters)
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+
+      // Count only when filters are active
+      if (hasFilter) {
+        const countRow = db.prepare(
+          `SELECT COUNT(*) as cnt FROM records ${where}`,
+        ).get(...params) as { cnt: number }
+        totalCount += countRow.cnt
+      }
+
+      if (!hasSort && !hasFilter) {
+        // No filter or sort — use offset-based pagination across datasets
+        // Skip this dataset if the page doesn't fall within it
+        const pageStart = (page - 1) * pageSize
+        const pageEnd = pageStart + pageSize
+        const dsStart = ds.offset
+        const dsEnd = ds.offset + ds.count
+
+        if (pageEnd <= dsStart || pageStart >= dsEnd) continue
+
+        const localOffset = Math.max(0, pageStart - dsStart)
+        const localLimit = Math.min(pageSize, dsEnd - Math.max(pageStart, dsStart))
+
+        const rows = db.prepare(
+          'SELECT idx, data FROM records ORDER BY idx LIMIT ? OFFSET ?',
+        ).all(localLimit, localOffset) as { idx: number; data: string }[]
+
+        for (const row of rows) {
+          allRecords.push({
+            absIndex: row.idx + ds.offset,
+            data: JSON.parse(row.data),
+          })
+        }
+      } else {
+        // With filter/sort — fetch all matching from this dataset
+        const selectCols = hasSort
+          ? `idx, data, json_extract(data, ?) as sort_val`
+          : 'idx, data'
+        const sortParams = hasSort ? [`$.${sortColumn}`] : []
+
+        const rows = db.prepare(
+          `SELECT ${selectCols} FROM records ${where} ORDER BY idx`,
+        ).all(...sortParams, ...params) as { idx: number; data: string; sort_val?: unknown }[]
+
+        for (const row of rows) {
+          allRecords.push({
+            absIndex: row.idx + ds.offset,
+            data: JSON.parse(row.data),
+            sortVal: row.sort_val,
+          })
+        }
+      }
+    } catch (err) {
+      console.error(`[SQLite] Query error on dataset ${ds.id}:`, err)
+    }
+  }
+
+  // Sort if needed (multi-dataset merge)
+  if (hasSort) {
+    const mult = sortDirection === 'asc' ? 1 : -1
+    allRecords.sort((a, b) => {
+      const av = a.sortVal
+      const bv = b.sortVal
+      if (av == null && bv == null) return 0
+      if (av == null) return 1
+      if (bv == null) return -1
+      if (typeof av === 'number' && typeof bv === 'number') return mult * (av - bv)
+      return mult * String(av).localeCompare(String(bv), undefined, { sensitivity: 'base', numeric: true })
+    })
+  }
+
+  // Paginate
+  const offset = (page - 1) * pageSize
+  const pageRecords = allRecords.slice(offset, offset + pageSize).map(r => ({
+    absIndex: r.absIndex,
+    data: r.data,
+  }))
+
+  return { totalCount, records: pageRecords, timeTaken: performance.now() - start }
 }

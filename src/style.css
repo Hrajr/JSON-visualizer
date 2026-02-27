@@ -33,7 +33,7 @@
 
   /* Monospace elements */
   code, pre, .font-mono {
-    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
     font-feature-settings: 'liga' on, 'calt' on;
   }
 

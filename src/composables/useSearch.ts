@@ -1,114 +1,115 @@
 /**
  * useSearch – composable for debounced search, property filtering,
- * and column sorting across multiple datasets via server-side SQLite.
+ * column sorting, and server-side pagination via SQLite.
  *
- * All heavy work (scanning, sorting) happens server-side so the browser
- * thread stays responsive.
+ * All heavy work (search, filter, sort, pagination) happens server-side
+ * in a single SQL query. The client only receives the current page's
+ * records — never millions of index arrays.
  */
 
-import { ref, watch, computed, type Ref } from 'vue'
-import type { DatasetRange } from '../types'
-import { searchRecords, sortRecords } from '../utils/db'
+import { ref, shallowRef, watch, computed, type Ref } from 'vue'
+import type { JsonRecord, DatasetRange } from '../types'
+import { queryPage } from '../utils/db'
+
+export interface PageRecord {
+  absIndex: number
+  data: JsonRecord
+}
 
 export function useSearch(totalCount: Ref<number>, datasetRanges: Ref<DatasetRange[]>) {
   const query = ref('')
   const propertyFilters = ref<string[]>([])
 
-  /** null = show all (no active search/filter). */
-  const matchingIndices = ref<number[] | null>(null)
-  const matchCount = computed(() =>
-    matchingIndices.value !== null ? matchingIndices.value.length : totalCount.value
-  )
-  const searchTime = ref(0)
-  const isSearching = ref(false)
+  // ── Pagination state ──
+  const page = ref(1)
+  const pageSize = ref(100)
 
   // ── Sort state ──
   const sortColumn = ref('')
   const sortDirection = ref<'asc' | 'desc'>('asc')
-  const sortedIndices = ref<number[] | null>(null)
-  const isSorting = ref(false)
 
-  /** Final indices for display: sort takes priority, then search, then null (all). */
-  const displayIndices = computed(() => {
-    if (sortedIndices.value) return sortedIndices.value
-    return matchingIndices.value
+  // ── Results ──
+  const matchCount = ref(0)
+  const searchTime = ref(0)
+  const isSearching = ref(false)
+  const isSorting = ref(false)
+  const pageRecords = shallowRef<PageRecord[]>([])
+
+  // Track whether any filter/search is active
+  const hasActiveQuery = computed(() => {
+    return query.value.trim() !== '' || propertyFilters.value.length > 0
   })
 
-  let debounceTimer: ReturnType<typeof setTimeout> | null = null
-  let searchAbort: AbortController | null = null
-  let sortAbort: AbortController | null = null
+  // Effective total: server-computed matchCount, or totalCount if no filter
+  const effectiveTotal = computed(() => {
+    if (hasActiveQuery.value) return matchCount.value
+    return totalCount.value
+  })
 
-  async function runSearch() {
-    const q = query.value.trim()
-    const pf = propertyFilters.value
+  let queryGeneration = 0
+  let fetchTimer: ReturnType<typeof setTimeout> | null = null
 
-    if (!q && pf.length === 0) {
-      matchingIndices.value = null
-      searchTime.value = 0
-      isSearching.value = false
+  /**
+   * Schedule a fetchPage with debounce.  Multiple callers within the
+   * debounce window are coalesced into a single request.
+   */
+  function scheduleFetch(delay = 0) {
+    if (fetchTimer) clearTimeout(fetchTimer)
+    if (delay <= 0) {
+      fetchTimer = null
+      fetchPage()
+    } else {
+      fetchTimer = setTimeout(() => { fetchTimer = null; fetchPage() }, delay)
+    }
+  }
 
-      if (sortColumn.value) {
-        runSort()
-      } else {
-        sortedIndices.value = null
-      }
+  /**
+   * Fetch one page of records from the server.
+   * Single endpoint handles search + filter + sort + LIMIT/OFFSET.
+   */
+  async function fetchPage() {
+    const gen = ++queryGeneration
+    const datasets = datasetRanges.value.map(r => ({ id: r.id, offset: r.offset, count: r.count }))
+
+    if (datasets.length === 0) {
+      pageRecords.value = []
+      matchCount.value = 0
       return
     }
 
     isSearching.value = true
 
-    // Cancel any in-flight search
-    if (searchAbort) searchAbort.abort()
-    searchAbort = new AbortController()
-
     try {
-      const datasets = datasetRanges.value.map(r => ({ id: r.id, offset: r.offset, count: r.count }))
-      const result = await searchRecords(datasets, q, pf)
+      const result = await queryPage(
+        datasets,
+        query.value.trim(),
+        propertyFilters.value,
+        sortColumn.value,
+        sortDirection.value,
+        page.value,
+        pageSize.value,
+      )
 
-      matchingIndices.value = result.indices
+      if (gen !== queryGeneration) return // stale response
+
+      matchCount.value = result.totalCount
+      pageRecords.value = result.records
       searchTime.value = Math.round(result.timeTaken * 100) / 100
-      isSearching.value = false
-
-      // Re-sort the new search results if sort is active
-      if (sortColumn.value) {
-        runSort()
-      } else {
-        sortedIndices.value = null
-      }
     } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') return
-      console.error('[Search]', err)
-      isSearching.value = false
+      if (gen !== queryGeneration) return
+      console.error('[Query]', err)
+    } finally {
+      if (gen === queryGeneration) {
+        isSearching.value = false
+        isSorting.value = false
+      }
     }
   }
 
-  async function runSort() {
-    if (!sortColumn.value) {
-      sortedIndices.value = null
-      isSorting.value = false
-      return
-    }
-    isSorting.value = true
-
-    // Cancel any in-flight sort
-    if (sortAbort) sortAbort.abort()
-    sortAbort = new AbortController()
-
-    try {
-      const datasets = datasetRanges.value.map(r => ({ id: r.id, offset: r.offset, count: r.count }))
-      const result = await sortRecords(
-        datasets,
-        sortColumn.value,
-        sortDirection.value,
-        matchingIndices.value,
-      )
-      sortedIndices.value = result.indices
-      isSorting.value = false
-    } catch (err) {
-      if (err instanceof Error && err.name === 'AbortError') return
-      console.error('[Sort]', err)
-      isSorting.value = false
-    }
+  /** Called when search/filter changes — reset to page 1, debounced. */
+  function onQueryChange() {
+    page.value = 1
+    scheduleFetch(250)
   }
 
   /** Toggle sort on a column. First click: asc, second: desc, third: clear. */
@@ -120,66 +121,74 @@ export function useSearch(totalCount: Ref<number>, datasetRanges: Ref<DatasetRan
         // Third click — clear sort
         sortColumn.value = ''
         sortDirection.value = 'asc'
-        sortedIndices.value = null
         isSorting.value = false
+        scheduleFetch()
         return
       }
     } else {
       sortColumn.value = column
       sortDirection.value = 'asc'
     }
-    runSort()
+    isSorting.value = true
+    scheduleFetch()
   }
 
   function resetSort() {
     sortColumn.value = ''
     sortDirection.value = 'asc'
-    sortedIndices.value = null
     isSorting.value = false
   }
 
-  // Debounced watch on query + propertyFilters
-  watch([query, propertyFilters], () => {
-    if (debounceTimer) clearTimeout(debounceTimer)
-    debounceTimer = setTimeout(runSearch, 250)
-  }, { deep: true })
+  function setPage(p: number) {
+    page.value = p
+    scheduleFetch()
+  }
 
-  // Re-run search when dataset ranges structurally change (dataset switch, not count updates)
+  function setPageSize(size: number) {
+    pageSize.value = size
+    page.value = 1
+    scheduleFetch()
+  }
+
+  // Debounced watch on query + propertyFilters
+  watch([query, propertyFilters], onQueryChange, { deep: true })
+
+  // Re-fetch when dataset ranges structurally change (dataset switch)
   let lastRangeSignature = ''
   watch(datasetRanges, (ranges) => {
-    const sig = ranges.map(r => r.id).join('|')
-    if (sig === lastRangeSignature) return // Just a count update during loading
+    const sig = ranges.map(r => `${r.id}:${r.count}`).join('|')
+    if (sig === lastRangeSignature) return
     lastRangeSignature = sig
-    if (query.value.trim() || propertyFilters.value.length > 0) {
-      if (debounceTimer) clearTimeout(debounceTimer)
-      debounceTimer = setTimeout(runSearch, 500)
-    } else {
-      matchingIndices.value = null
-      if (sortColumn.value) runSort()
-      else sortedIndices.value = null
-    }
+    page.value = 1
+    scheduleFetch(100)
   }, { deep: true })
 
+  // Re-fetch when totalCount changes during loading (debounced, coalesced)
+  watch(totalCount, () => {
+    scheduleFetch(800)
+  })
+
   function dispose() {
-    if (debounceTimer) clearTimeout(debounceTimer)
-    if (searchAbort) searchAbort.abort()
-    if (sortAbort) sortAbort.abort()
+    if (fetchTimer) clearTimeout(fetchTimer)
   }
 
   return {
     query,
     propertyFilters,
-    matchingIndices,
-    matchCount,
+    matchCount: effectiveTotal,
     searchTime,
     isSearching,
     sortColumn,
     sortDirection,
-    sortedIndices,
     isSorting,
-    displayIndices,
+    page,
+    pageSize,
+    pageRecords,
     setSort,
     resetSort,
+    setPage,
+    setPageSize,
+    fetchPage,
     dispose,
   }
 }

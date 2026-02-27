@@ -121,9 +121,12 @@ const {
   propertyFilters,
   matchCount, searchTime, isSearching,
   sortColumn, sortDirection, isSorting,
-  displayIndices,
+  page, pageSize, pageRecords,
   setSort,
   resetSort,
+  setPage,
+  setPageSize,
+  fetchPage,
   dispose: disposeSearch,
 } = useSearch(displayRecordCount, effectiveRanges)
 
@@ -579,17 +582,20 @@ onBeforeUnmount(() => {
         <main class="flex-1 min-w-0 flex flex-col">
           <PaginatedTable
             v-if="isDataReady"
-            :record-count="displayRecordCount"
+            :total-count="matchCount"
             :columns="visibleColumns"
-            :filtered-indices="displayIndices"
+            :records="pageRecords"
+            :page="page"
+            :page-size="pageSize"
             :is-loading="viewMode === 'loading'"
-            :dataset-ranges="effectiveRanges"
             :sort-column="sortColumn"
             :sort-direction="sortDirection"
             :is-sorting="isSorting"
             @select-row="onSelectRow"
             @sort="onSort"
             @reorder-column="reorderColumn"
+            @page-change="setPage"
+            @page-size-change="setPageSize"
           />
         </main>
       </template>

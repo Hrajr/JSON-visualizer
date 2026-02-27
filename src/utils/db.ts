@@ -112,6 +112,29 @@ export async function getRecordsByAbsoluteIndices(
 
 // ── Server API: Search & Sort ──
 
+export interface QueryPageResult {
+  totalCount: number
+  records: { absIndex: number; data: JsonRecord }[]
+  timeTaken: number
+}
+
+export async function queryPage(
+  datasets: { id: string; offset: number; count: number }[],
+  query: string,
+  propertyFilters: string[],
+  sortColumn: string,
+  sortDirection: 'asc' | 'desc',
+  page: number,
+  pageSize: number,
+): Promise<QueryPageResult> {
+  const res = await fetch('/api/db/query', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ datasets, query, propertyFilters, sortColumn, sortDirection, page, pageSize }),
+  })
+  return res.json()
+}
+
 export async function searchRecords(
   datasets: { id: string; offset: number; count: number }[],
   query: string,

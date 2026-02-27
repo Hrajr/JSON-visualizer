@@ -1,137 +1,61 @@
 <script setup lang="ts">
 /**
- * PaginatedTable – table with pagination for large datasets.
+ * PaginatedTable – table with server-side pagination.
  *
- * Records are loaded from server-side SQLite on demand via multi-dataset
- * absolute indexing. Only the current page's rows are in memory.
+ * Records are provided by the parent (via useSearch composable which
+ * queries server-side SQLite with LIMIT/OFFSET). This component only
+ * manages pagination controls and display.
  *
  * Supports sortable column headers: click to cycle asc → desc → none.
  */
-import { ref, shallowRef, computed, watch, onMounted, reactive } from 'vue'
-import type { JsonRecord, ColumnDef, DatasetRange } from '../types'
+import { ref, computed, watch, reactive } from 'vue'
+import type { JsonRecord, ColumnDef } from '../types'
 import { formatColumnName } from '../utils/format'
-import { getRecordsByAbsoluteIndices } from '../utils/db'
+
+interface PageRecord {
+  absIndex: number
+  data: JsonRecord
+}
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100, 250, 500]
 
 const props = defineProps<{
-  /** Total number of records available across active datasets. */
-  recordCount: number
+  /** Total number of matching records (for pagination). */
+  totalCount: number
   columns: ColumnDef[]
-  /** Filtered/sorted indices (null = show all). */
-  filteredIndices: number[] | null
-  /** When true, adds bottom padding so the fixed loading footer doesn't overlap pagination. */
+  /** Current page records from the server. */
+  records: PageRecord[]
+  /** When true, adds bottom padding so the fixed loading footer doesn't overlap. */
   isLoading?: boolean
-  /** Dataset ranges for multi-DB record access. */
-  datasetRanges: DatasetRange[]
   /** Currently sorted column key (empty = no sort). */
   sortColumn?: string
   /** Sort direction. */
   sortDirection?: 'asc' | 'desc'
-  /** Whether a sort operation is in progress. */
+  /** Whether a sort/search is in progress. */
   isSorting?: boolean
+  /** Current page (1-based). */
+  page: number
+  /** Current page size. */
+  pageSize: number
 }>()
 
 const emit = defineEmits<{
   (e: 'select-row', index: number): void
   (e: 'sort', column: string): void
   (e: 'reorder-column', fromKey: string, toKey: string): void
+  (e: 'page-change', page: number): void
+  (e: 'page-size-change', size: number): void
 }>()
 
-const pageSize = ref(100)
-const currentPage = ref(1)
+// ── Pagination ──
+const totalPages = computed(() => Math.max(1, Math.ceil(props.totalCount / props.pageSize)))
 
-// ── Total row count (filtered or all) ──
-const totalRows = computed(() => props.filteredIndices?.length ?? props.recordCount)
-const totalPages = computed(() => Math.max(1, Math.ceil(totalRows.value / pageSize.value)))
+const startRecord = computed(() => (props.page - 1) * props.pageSize + 1)
+const endRecord = computed(() => Math.min(props.page * props.pageSize, props.totalCount))
 
-// Clamp currentPage when data changes
-watch(totalPages, () => {
-  if (currentPage.value > totalPages.value) {
-    currentPage.value = Math.max(1, totalPages.value)
-  }
-})
-
-// Reset to page 1 when filter changes
-watch(() => props.filteredIndices, () => {
-  currentPage.value = 1
-})
-
-// ── Compute which indices belong on the current page ──
-const pageRows = computed(() => {
-  const total = totalRows.value
-  const start = (currentPage.value - 1) * pageSize.value
-  const end = Math.min(start + pageSize.value, total)
-  const rows: { dataIndex: number; displayIndex: number }[] = []
-
-  if (props.filteredIndices) {
-    for (let i = start; i < end; i++) {
-      rows.push({ dataIndex: props.filteredIndices[i], displayIndex: i })
-    }
-  } else {
-    for (let i = start; i < end; i++) {
-      rows.push({ dataIndex: i, displayIndex: i })
-    }
-  }
-
-  return rows
-})
-
-// ── Async page records from server ──
-const pageRecords = shallowRef<Map<number, JsonRecord>>(new Map())
-const isPageLoading = ref(false)
-let loadGeneration = 0
-
-async function loadPage() {
-  const gen = ++loadGeneration
-  const rows = pageRows.value
-  const indices = rows.map((r) => r.dataIndex)
-
-  if (indices.length === 0) {
-    pageRecords.value = new Map()
-    return
-  }
-
-  isPageLoading.value = true
-  try {
-    const records = await getRecordsByAbsoluteIndices(props.datasetRanges, indices)
-    if (gen !== loadGeneration) return // stale
-    const map = new Map<number, JsonRecord>()
-    for (let i = 0; i < indices.length; i++) {
-      if (records[i]) map.set(indices[i], records[i]!)
-    }
-    pageRecords.value = map
-  } catch (err) {
-    console.error('Failed to load page records:', err)
-    if (gen === loadGeneration) pageRecords.value = new Map()
-  } finally {
-    if (gen === loadGeneration) isPageLoading.value = false
-  }
-}
-
-// Reload on page / pageSize change
-watch([currentPage, pageSize], loadPage)
-
-// Reload on filter change
-watch(() => props.filteredIndices, loadPage)
-
-// Reload when dataset ranges change (switching datasets)
-watch(() => props.datasetRanges, loadPage, { deep: true })
-
-// Debounce reload when recordCount grows (during parsing)
-let rcTimer: ReturnType<typeof setTimeout> | null = null
-watch(() => props.recordCount, () => {
-  if (rcTimer) clearTimeout(rcTimer)
-  rcTimer = setTimeout(loadPage, 500)
-})
-
-// Initial load
-onMounted(loadPage)
-
-// ── Pagination range ──
 const pageRange = computed(() => {
   const total = totalPages.value
-  const current = currentPage.value
+  const current = props.page
   const delta = 2
   const range: number[] = []
   const start = Math.max(1, current - delta)
@@ -143,7 +67,14 @@ const pageRange = computed(() => {
 })
 
 function goToPage(page: number) {
-  if (page >= 1 && page <= totalPages.value) currentPage.value = page
+  if (page >= 1 && page <= totalPages.value) {
+    emit('page-change', page)
+  }
+}
+
+function onPageSizeChange(e: Event) {
+  const size = parseInt((e.target as HTMLSelectElement).value, 10)
+  emit('page-size-change', size)
 }
 
 function getCellValue(record: JsonRecord | undefined, key: string): string {
@@ -154,12 +85,8 @@ function getCellValue(record: JsonRecord | undefined, key: string): string {
   return String(val)
 }
 
-function onPageSizeChange(e: Event) {
-  pageSize.value = parseInt((e.target as HTMLSelectElement).value, 10)
-  currentPage.value = 1
-}
-
 function onHeaderClick(column: string) {
+  if (isResizingColumn.value || justFinishedResize.value) return
   emit('sort', column)
 }
 
@@ -187,9 +114,6 @@ function onColDrop(targetKey: string) {
 }
 function onColDragEnd() { dragSourceKey.value = ''; dragOverKey.value = '' }
 
-const startRecord = computed(() => (currentPage.value - 1) * pageSize.value + 1)
-const endRecord = computed(() => Math.min(currentPage.value * pageSize.value, totalRows.value))
-
 // ── Column resize ──
 const DEFAULT_COL_WIDTH = 180
 const MIN_COL_WIDTH = 60
@@ -200,6 +124,7 @@ function getColWidth(key: string): number {
 }
 
 const isResizingColumn = ref(false)
+const justFinishedResize = ref(false)
 
 function onResizeStart(e: MouseEvent, key: string) {
   e.preventDefault()
@@ -214,6 +139,8 @@ function onResizeStart(e: MouseEvent, key: string) {
   }
   function onMouseUp() {
     isResizingColumn.value = false
+    justFinishedResize.value = true
+    setTimeout(() => { justFinishedResize.value = false }, 200)
     document.removeEventListener('mousemove', onMouseMove)
     document.removeEventListener('mouseup', onMouseUp)
   }
@@ -315,13 +242,13 @@ function pinnedLeft(col: ColumnDef): number {
         <!-- Body – only current page rows -->
         <tbody>
           <tr
-            v-for="row in pageRows"
-            :key="row.dataIndex"
+            v-for="row in records"
+            :key="row.absIndex"
             class="border-b border-gray-100/80 dark:border-gray-800/60 hover:bg-blue-50/60 dark:hover:bg-blue-950/30 cursor-pointer transition-colors"
-            @click="emit('select-row', row.dataIndex)"
+            @click="emit('select-row', row.absIndex)"
           >
             <td class="shrink-0 w-16 px-3 py-1.5 text-[11px] font-mono text-gray-400 dark:text-gray-500 border-r border-gray-100/60 dark:border-gray-800/40 bg-white dark:bg-gray-900 sticky left-0 z-10 text-right tabular-nums">
-              {{ row.dataIndex + 1 }}
+              {{ row.absIndex + 1 }}
             </td>
             <td
               v-for="col in columns"
@@ -337,21 +264,18 @@ function pinnedLeft(col: ColumnDef): number {
             >
               <span
                 class="cell-truncate block text-gray-700 dark:text-gray-300"
-                :title="getCellValue(pageRecords.get(row.dataIndex), col.key)"
+                :title="getCellValue(row.data, col.key)"
               >
-                {{ getCellValue(pageRecords.get(row.dataIndex), col.key) }}
+                {{ getCellValue(row.data, col.key) }}
               </span>
             </td>
           </tr>
         </tbody>
       </table>
 
-      <!-- Empty states -->
-      <div v-if="totalRows === 0 && recordCount > 0" class="py-16 text-center text-gray-400 dark:text-gray-600 text-sm">
-        No matching records found
-      </div>
-      <div v-if="recordCount === 0 && !isLoading" class="py-16 text-center text-gray-400 dark:text-gray-600 text-sm">
-        No data loaded
+      <!-- Empty state -->
+      <div v-if="totalCount === 0 && !isLoading" class="py-16 text-center text-gray-400 dark:text-gray-600 text-sm">
+        No records to display
       </div>
       <!-- Bottom spacer when loading footer is visible -->
       <div v-if="isLoading" class="h-8 shrink-0"></div>
@@ -359,7 +283,7 @@ function pinnedLeft(col: ColumnDef): number {
 
     <!-- Pagination footer -->
     <div
-      v-if="totalRows > 0"
+      v-if="totalCount > 0"
       class="shrink-0 flex items-center justify-between gap-4 px-4 py-2.5 border-t border-gray-200/80 dark:border-gray-700/80 bg-white dark:bg-gray-900 text-xs transition-[padding] duration-300"
       :class="isLoading ? 'pb-8' : ''"
     >
@@ -377,28 +301,28 @@ function pinnedLeft(col: ColumnDef): number {
           </select>
         </div>
         <span class="text-gray-400 dark:text-gray-500">
-          {{ startRecord.toLocaleString() }}–{{ endRecord.toLocaleString() }} of {{ totalRows.toLocaleString() }}
+          {{ startRecord.toLocaleString() }}–{{ endRecord.toLocaleString() }} of {{ totalCount.toLocaleString() }}
         </span>
       </div>
 
       <!-- Right: pagination buttons -->
       <div class="flex items-center gap-1">
-        <button class="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-gray-500 dark:text-gray-400" :disabled="currentPage === 1" title="First page" @click="goToPage(1)">
+        <button class="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-gray-500 dark:text-gray-400" :disabled="page === 1" title="First page" @click="goToPage(1)">
           <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M11 19l-7-7 7-7m8 14l-7-7 7-7" /></svg>
         </button>
-        <button class="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-gray-500 dark:text-gray-400" :disabled="currentPage === 1" title="Previous page" @click="goToPage(currentPage - 1)">
+        <button class="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-gray-500 dark:text-gray-400" :disabled="page === 1" title="Previous page" @click="goToPage(page - 1)">
           <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7" /></svg>
         </button>
 
-        <template v-for="(page, idx) in pageRange" :key="idx">
-          <span v-if="page === -1" class="px-1 text-gray-400 dark:text-gray-600 select-none">…</span>
-          <button v-else class="min-w-[24px] h-6 rounded text-center transition-colors" :class="page === currentPage ? 'bg-blue-600 text-white font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'" @click="goToPage(page)">{{ page }}</button>
+        <template v-for="(pg, idx) in pageRange" :key="idx">
+          <span v-if="pg === -1" class="px-1 text-gray-400 dark:text-gray-600 select-none">…</span>
+          <button v-else class="min-w-[24px] h-6 rounded text-center transition-colors" :class="pg === page ? 'bg-blue-600 text-white font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'" @click="goToPage(pg)">{{ pg }}</button>
         </template>
 
-        <button class="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-gray-500 dark:text-gray-400" :disabled="currentPage === totalPages" title="Next page" @click="goToPage(currentPage + 1)">
+        <button class="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-gray-500 dark:text-gray-400" :disabled="page === totalPages" title="Next page" @click="goToPage(page + 1)">
           <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" /></svg>
         </button>
-        <button class="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-gray-500 dark:text-gray-400" :disabled="currentPage === totalPages" title="Last page" @click="goToPage(totalPages)">
+        <button class="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-gray-500 dark:text-gray-400" :disabled="page === totalPages" title="Last page" @click="goToPage(totalPages)">
           <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M13 5l7 7-7 7M5 5l7 7-7 7" /></svg>
         </button>
       </div>
