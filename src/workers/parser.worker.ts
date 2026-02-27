@@ -49,6 +49,7 @@ function openWorkerDB(dbName: string): Promise<IDBDatabase> {
     }
     req.onsuccess = () => { db = req.result; resolve(db) }
     req.onerror = () => reject(req.error)
+    req.onblocked = () => reject(new Error(`Worker IDB open blocked: ${dbName}`))
   })
 }
 
@@ -158,7 +159,7 @@ interface ParseContext {
   batchStartIndex: number
 }
 
-const IDB_FLUSH_SIZE = 2000
+const IDB_FLUSH_SIZE = 500
 
 function createContext(dbName: string, maxRecords: number, totalBytes: number): ParseContext {
   return {
@@ -286,40 +287,48 @@ async function finalize(ctx: ParseContext) {
 // ── Parse entry points ──
 
 async function parseFromFile(file: File, maxRecords: number, dbName: string) {
-  await clearDB(dbName)
-  const ctx = createContext(dbName, maxRecords, file.size)
+  try {
+    await clearDB(dbName)
+    const ctx = createContext(dbName, maxRecords, file.size)
 
-  if (typeof file.stream === 'function') {
-    const reader = file.stream().getReader()
-    const decoder = new TextDecoder('utf-8')
-    try {
-      while (true) {
-        if (cancelled) { reader.cancel(); closeWorkerDB(); self.postMessage({ type: 'cancelled' }); return }
-        const { done, value } = await reader.read()
-        if (done) break
-        if (await processChunk(ctx, decoder.decode(value, { stream: true }), value.byteLength)) return
+    if (typeof file.stream === 'function') {
+      const reader = file.stream().getReader()
+      const decoder = new TextDecoder('utf-8')
+      try {
+        while (true) {
+          if (cancelled) { reader.cancel(); closeWorkerDB(); self.postMessage({ type: 'cancelled' }); return }
+          const { done, value } = await reader.read()
+          if (done) break
+          if (await processChunk(ctx, decoder.decode(value, { stream: true }), value.byteLength)) return
+        }
+      } catch (err) {
+        closeWorkerDB()
+        self.postMessage({ type: 'error', error: {
+          recordIndex: -1, snippet: '',
+          message: err instanceof Error ? err.message : String(err),
+        } })
+        return
       }
-    } catch (err) {
-      closeWorkerDB()
-      self.postMessage({ type: 'error', error: {
-        recordIndex: -1, snippet: '',
-        message: err instanceof Error ? err.message : String(err),
-      } })
-      return
+    } else {
+      const CHUNK_SIZE = 2 * 1024 * 1024
+      let offset = 0
+      while (offset < file.size) {
+        if (cancelled) { closeWorkerDB(); self.postMessage({ type: 'cancelled' }); return }
+        const end = Math.min(offset + CHUNK_SIZE, file.size)
+        const text = await file.slice(offset, end).text()
+        if (await processChunk(ctx, text, end - offset)) return
+        offset = end
+      }
     }
-  } else {
-    const CHUNK_SIZE = 2 * 1024 * 1024
-    let offset = 0
-    while (offset < file.size) {
-      if (cancelled) { closeWorkerDB(); self.postMessage({ type: 'cancelled' }); return }
-      const end = Math.min(offset + CHUNK_SIZE, file.size)
-      const text = await file.slice(offset, end).text()
-      if (await processChunk(ctx, text, end - offset)) return
-      offset = end
-    }
-  }
 
-  await finalize(ctx)
+    await finalize(ctx)
+  } catch (err) {
+    closeWorkerDB()
+    self.postMessage({ type: 'error', error: {
+      recordIndex: -1, snippet: '',
+      message: 'File parse failed: ' + (err instanceof Error ? err.message : String(err)),
+    } })
+  }
 }
 
 async function parseFromUrl(url: string, maxRecords: number, dbName: string) {
@@ -375,13 +384,21 @@ self.onmessage = async (e: MessageEvent) => {
     return
   }
 
-  if (msg.type === 'start') {
-    cancelled = false
-    await parseFromFile(msg.file, msg.maxRecords || 0, msg.dbName)
-  }
+  try {
+    if (msg.type === 'start') {
+      cancelled = false
+      await parseFromFile(msg.file, msg.maxRecords || 0, msg.dbName)
+    }
 
-  if (msg.type === 'start-url') {
-    cancelled = false
-    await parseFromUrl(msg.url, msg.maxRecords || 0, msg.dbName)
+    if (msg.type === 'start-url') {
+      cancelled = false
+      await parseFromUrl(msg.url, msg.maxRecords || 0, msg.dbName)
+    }
+  } catch (err) {
+    closeWorkerDB()
+    self.postMessage({ type: 'error', error: {
+      recordIndex: -1, snippet: '',
+      message: 'Worker error: ' + (err instanceof Error ? err.message : String(err)),
+    } })
   }
 }

@@ -157,6 +157,18 @@ const columnFilterText = ref('')
 // ── Computed states ──
 const isDataReady = computed(() => viewMode.value === 'loading' || viewMode.value === 'viewing')
 
+// ── Watch parser state for errors ──
+watch(parserState, (state) => {
+  if (state === 'error' && viewMode.value === 'loading') {
+    // If we have previously active datasets, go back to viewing
+    if (activeDatasets.value.length > 0) {
+      viewMode.value = 'viewing'
+    } else {
+      viewMode.value = 'idle'
+    }
+  }
+})
+
 // ── Parser completion callback ──
 onParserComplete((info) => {
   addDataset(info)
@@ -469,7 +481,7 @@ onBeforeUnmount(() => {
     <!-- Error toast -->
     <Transition name="fade">
       <div
-        v-if="errors.length > 0 && viewMode === 'viewing'"
+        v-if="errors.length > 0"
         class="fixed bottom-4 right-4 bg-amber-50 dark:bg-amber-950/80 border border-amber-200 dark:border-amber-800 rounded-xl shadow-lg p-4 max-w-sm z-30"
       >
         <div class="flex items-start gap-2">

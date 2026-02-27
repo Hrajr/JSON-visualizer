@@ -100,6 +100,9 @@ async function loadPage() {
       if (records[i]) map.set(indices[i], records[i]!)
     }
     pageRecords.value = map
+  } catch (err) {
+    console.error('Failed to load page records:', err)
+    if (gen === loadGeneration) pageRecords.value = new Map()
   } finally {
     if (gen === loadGeneration) isPageLoading.value = false
   }

@@ -78,6 +78,7 @@ export function openNamedDB(name: string): Promise<IDBDatabase> {
       resolve(req.result)
     }
     req.onerror = () => reject(req.error)
+    req.onblocked = () => reject(new Error(`IDB open blocked: ${name}`))
   })
 }
 

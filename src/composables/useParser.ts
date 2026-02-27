@@ -80,13 +80,22 @@ export function useParser() {
 
         case 'error':
           errors.value = [...errors.value, msg.error]
+          // Fatal infrastructure error (not a bad record) → stop loading
+          if (msg.error.recordIndex === -1) {
+            state.value = 'error'
+          }
           break
 
         case 'done': {
           state.value = 'loaded'
           recordsParsed.value = msg.totalRecords
           dbRecordCount.value = msg.totalRecords
-          if (onCompleteCallback) onCompleteCallback(buildDatasetInfo(msg.totalRecords))
+          try {
+            if (onCompleteCallback) onCompleteCallback(buildDatasetInfo(msg.totalRecords))
+          } catch (err) {
+            console.error('onComplete callback error:', err)
+            state.value = 'error'
+          }
           break
         }
 
@@ -95,7 +104,12 @@ export function useParser() {
           state.value = 'loaded'
           recordsParsed.value = msg.totalRecords
           dbRecordCount.value = msg.totalRecords
-          if (onCompleteCallback) onCompleteCallback(buildDatasetInfo(msg.totalRecords))
+          try {
+            if (onCompleteCallback) onCompleteCallback(buildDatasetInfo(msg.totalRecords))
+          } catch (err) {
+            console.error('onComplete callback error:', err)
+            state.value = 'error'
+          }
           break
         }
 
