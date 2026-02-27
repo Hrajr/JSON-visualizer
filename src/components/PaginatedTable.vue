@@ -15,6 +15,8 @@ const props = defineProps<{
   columns: ColumnDef[]
   /** Filtered indices (null = show all). Comes from search across ALL records. */
   filteredIndices: number[] | null
+  /** When true, adds bottom padding so the fixed loading footer doesn't overlap pagination */
+  isLoading?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -176,12 +178,15 @@ const endRecord = computed(() => Math.min(currentPage.value * pageSize.value, to
       <div v-if="records.length === 0" class="py-16 text-center text-gray-400 dark:text-gray-600 text-sm">
         No data loaded
       </div>
+      <!-- Bottom spacer when loading footer is visible (so scroll area isn't hidden) -->
+      <div v-if="isLoading" class="h-8 shrink-0"></div>
     </div>
 
     <!-- Pagination footer -->
     <div
       v-if="totalRows > 0"
-      class="shrink-0 flex items-center justify-between gap-4 px-3 py-2 border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-xs"
+      class="shrink-0 flex items-center justify-between gap-4 px-3 py-2 border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-xs transition-[padding] duration-300"
+      :class="isLoading ? 'pb-8' : ''"
     >
       <!-- Left: page size & info -->
       <div class="flex items-center gap-3 text-gray-500 dark:text-gray-400">

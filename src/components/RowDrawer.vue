@@ -154,21 +154,24 @@ function valueColor(val: unknown): string {
               </svg>
               Populated ({{ populatedEntries.length }})
             </h3>
-            <div class="space-y-1">
+            <!-- Grid table with aligned columns -->
+            <div class="border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
               <div
-                v-for="entry in populatedEntries"
+                v-for="(entry, idx) in populatedEntries"
                 :key="entry.key"
-                class="flex gap-3 px-3 py-2 rounded-lg bg-gray-50 dark:bg-gray-800/60 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors group"
+                class="grid grid-cols-[minmax(140px,2fr)_minmax(0,3fr)] border-b border-gray-100 dark:border-gray-800 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-800/60 transition-colors"
+                :class="idx % 2 === 0 ? 'bg-white dark:bg-gray-900' : 'bg-gray-50/50 dark:bg-gray-850'"
               >
-                <span class="text-xs font-medium text-gray-500 dark:text-gray-400 min-w-[120px] shrink-0 pt-0.5">
+                <div class="px-3 py-2 text-xs font-medium text-gray-500 dark:text-gray-400 border-r border-gray-100 dark:border-gray-800 break-words hyphens-auto leading-relaxed">
                   {{ formatColumnName(entry.key) }}
-                </span>
-                <span
-                  class="text-xs break-all flex-1"
+                </div>
+                <div
+                  class="px-3 py-2 text-xs break-words hyphens-auto leading-relaxed min-w-0"
                   :class="valueColor(entry.rawValue)"
                 >
-                  {{ formatValue(entry.rawValue) }}
-                </span>
+                  <pre v-if="typeof entry.rawValue === 'object'" class="whitespace-pre-wrap font-mono text-[11px] m-0">{{ formatValue(entry.rawValue) }}</pre>
+                  <span v-else>{{ formatValue(entry.rawValue) }}</span>
+                </div>
               </div>
             </div>
           </div>

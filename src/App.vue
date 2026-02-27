@@ -4,7 +4,7 @@
  * Wires FileLoader, SearchBar, ColumnManager, VirtualTable, RowDrawer.
  * Includes dark/light mode toggle and keyboard shortcuts.
  */
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import FileLoader from './components/FileLoader.vue'
 import SearchBar from './components/SearchBar.vue'
 import ColumnManager from './components/ColumnManager.vue'
@@ -42,6 +42,19 @@ const {
   query: searchQuery, matchingIndices, matchCount, searchTime, isSearching,
   dispose: disposeSearch,
 } = useSearch(searchStrings, totalRecordCount)
+
+// ── Property filter (non-empty filter) ──
+const propertyFilter = ref<string>('')
+
+const propertyFilteredIndices = computed(() => {
+  if (!propertyFilter.value) return matchingIndices.value
+  const key = propertyFilter.value
+  const source = matchingIndices.value ?? Array.from({ length: records.value.length }, (_, i) => i)
+  return source.filter(i => {
+    const val = records.value[i]?.[key]
+    return val !== null && val !== undefined && val !== ''
+  })
+})
 
 // ── Row drawer ──
 const selectedRowIndex = ref<number>(-1)
@@ -92,6 +105,7 @@ function onReset() {
   resetParser()
   resetColumns()
   searchQuery.value = ''
+  propertyFilter.value = ''
   selectedRowIndex.value = -1
   drawerOpen.value = false
 }
@@ -139,6 +153,21 @@ const isDataReady = computed(() =>
             :search-time="searchTime"
             :is-searching="isSearching"
           />
+
+          <!-- Non-empty property filter -->
+          <div class="flex items-center gap-1.5">
+            <select
+              v-model="propertyFilter"
+              class="px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 focus:outline-none focus:ring-2 focus:ring-blue-400 max-w-[180px] truncate"
+              title="Filter records that have a value for this property"
+            >
+              <option value="">All properties</option>
+              <option v-for="key in allKeysList" :key="key" :value="key">
+                {{ key }}
+              </option>
+            </select>
+            <span v-if="propertyFilter" class="text-[10px] text-gray-400 dark:text-gray-500 whitespace-nowrap">has value</span>
+          </div>
         </template>
 
         <div class="ml-auto flex items-center gap-1">
@@ -245,7 +274,8 @@ const isDataReady = computed(() =>
             v-if="isDataReady"
             :records="records"
             :columns="visibleColumns"
-            :filtered-indices="matchingIndices"
+            :filtered-indices="propertyFilteredIndices"
+            :is-loading="state === 'loading'"
             @select-row="onSelectRow"
           />
         </main>
