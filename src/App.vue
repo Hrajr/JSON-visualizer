@@ -1,34 +1,108 @@
 <script setup lang="ts">
 /**
  * App.vue – Root component.
- * Wires FileLoader, SearchBar, ColumnManager, PaginatedTable, RowDrawer.
- * Records live in IndexedDB – only one page of data is in memory at a time.
+ *
+ * Integrates: FileLoader, SearchBar, ColumnManager, PaginatedTable,
+ * RowDrawer, LoadingFooter, DatasetManager.
+ *
+ * Architecture:
+ *   - useParser: manages file parsing into a new dataset (IndexedDB)
+ *   - useDatasets: manages persistence, multi-dataset selection
+ *   - useSearch: search + sort across active datasets
+ *   - useColumns: column visibility / order / pinning
+ *
+ * On page reload, datasets are restored from localStorage + IndexedDB.
  */
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import FileLoader from './components/FileLoader.vue'
 import SearchBar from './components/SearchBar.vue'
 import ColumnManager from './components/ColumnManager.vue'
 import PaginatedTable from './components/PaginatedTable.vue'
 import RowDrawer from './components/RowDrawer.vue'
 import LoadingFooter from './components/LoadingFooter.vue'
+import DatasetManager from './components/DatasetManager.vue'
 
 import { useParser } from './composables/useParser'
+import { useDatasets } from './composables/useDatasets'
 import { useSearch } from './composables/useSearch'
 import { useColumns } from './composables/useColumns'
 import { useTheme } from './composables/useTheme'
-import { getRecord } from './utils/db'
-import type { JsonRecord } from './types'
+import { formatColumnName } from './utils/format'
+import { getRecordFromDB } from './utils/db'
+import type { JsonRecord, DatasetRange } from './types'
 
 // ── Theme ──
 const { isDark, toggle: toggleTheme } = useTheme()
 
-// ── Parser (IndexedDB-backed) ──
+// ── View mode ──
+// 'idle'    = show FileLoader full-page
+// 'loading' = parsing in progress, show table + loading footer
+// 'viewing' = data loaded, show table
+const viewMode = ref<'idle' | 'loading' | 'viewing'>('idle')
+
+// ── Parser ──
 const {
-  allKeys, errors, state,
-  bytesRead, totalBytes, recordsParsed, dbRecordCount, progress, fileName,
+  allKeys: parserAllKeys,
+  errors,
+  state: parserState,
+  bytesRead, totalBytes, recordsParsed, dbRecordCount, progress,
+  fileName: parserFileName,
   limitReached, maxRecords,
-  startParsing, startParsingUrl, cancelParsing, reset: resetParser,
+  currentDbName,
+  startParsing, startParsingUrl, cancelParsing,
+  reset: resetParser,
+  onComplete: onParserComplete,
 } = useParser()
+
+// ── Datasets ──
+const {
+  datasets,
+  activeIds,
+  activeDatasets,
+  datasetRanges,
+  totalRecordCount,
+  combinedKeys,
+  init: initDatasets,
+  addDataset,
+  selectDataset,
+  toggleDataset,
+  removeDataset,
+  getRecord: getDatasetRecord,
+} = useDatasets()
+
+// ── Effective display state (bridges loading vs viewing modes) ──
+const displayRecordCount = computed(() => {
+  if (viewMode.value === 'loading') return dbRecordCount.value
+  return totalRecordCount.value
+})
+
+const displayKeys = computed(() => {
+  if (viewMode.value === 'loading') return parserAllKeys.value
+  if (viewMode.value === 'viewing') return combinedKeys.value
+  return new Map<string, number>()
+})
+
+const effectiveRanges = computed<DatasetRange[]>(() => {
+  if (viewMode.value === 'loading') {
+    return dbRecordCount.value > 0
+      ? [{ id: 'loading', dbName: currentDbName.value, offset: 0, count: dbRecordCount.value }]
+      : []
+  }
+  return datasetRanges.value
+})
+
+const displayFileName = computed(() => {
+  if (viewMode.value === 'loading') return parserFileName.value
+  const active = activeDatasets.value
+  if (active.length === 0) return ''
+  if (active.length === 1) return active[0].fileName
+  return `${active.length} datasets selected`
+})
+
+const displayTotalBytes = computed(() => {
+  if (viewMode.value === 'loading') return totalBytes.value
+  return activeDatasets.value.reduce((sum, ds) => sum + ds.totalBytes, 0)
+})
 
 // ── Columns ──
 const {
@@ -36,29 +110,40 @@ const {
   toggleVisibility, togglePin, moveColumn,
   showAll: showAllColumns, hideAll: hideAllColumns,
   reset: resetColumns,
-} = useColumns(allKeys)
+} = useColumns(displayKeys)
 
-// ── Search (reads IndexedDB directly via worker) ──
+// ── Search + Sort ──
 const {
   query: searchQuery,
   propertyFilter,
-  matchingIndices, matchCount, searchTime, isSearching,
+  matchCount, searchTime, isSearching,
+  sortColumn, sortDirection, isSorting,
+  displayIndices,
+  setSort,
+  resetSort,
   dispose: disposeSearch,
-} = useSearch(dbRecordCount)
+} = useSearch(displayRecordCount, effectiveRanges)
 
 // ── Row drawer ──
 const selectedRowIndex = ref<number>(-1)
 const drawerOpen = ref(false)
 const selectedRecord = ref<JsonRecord | null>(null)
 
-const allKeysList = computed(() => Array.from(allKeys.value.keys()))
+const allKeysList = computed(() => Array.from(displayKeys.value.keys()))
 
 async function onSelectRow(index: number) {
   selectedRowIndex.value = index
   drawerOpen.value = true
   selectedRecord.value = null
-  const rec = await getRecord(index)
-  selectedRecord.value = rec ?? null
+
+  if (viewMode.value === 'loading') {
+    // During loading, use the single loading DB
+    const rec = await getRecordFromDB(currentDbName.value, index)
+    selectedRecord.value = rec ?? null
+  } else {
+    const rec = await getDatasetRecord(index)
+    selectedRecord.value = rec ?? null
+  }
 }
 
 function closeDrawer() {
@@ -69,13 +154,24 @@ function closeDrawer() {
 const sidebarOpen = ref(true)
 const columnFilterText = ref('')
 
+// ── Computed states ──
+const isDataReady = computed(() => viewMode.value === 'loading' || viewMode.value === 'viewing')
+
+// ── Parser completion callback ──
+onParserComplete((info) => {
+  addDataset(info)
+  viewMode.value = 'viewing'
+})
+
 // ── File loading ──
 function onLoadFile(file: File) {
   resetColumns()
   searchQuery.value = ''
   propertyFilter.value = ''
+  resetSort()
   selectedRowIndex.value = -1
   drawerOpen.value = false
+  viewMode.value = 'loading'
   startParsing(file)
 }
 
@@ -83,26 +179,81 @@ function onLoadUrl(url: string, name: string) {
   resetColumns()
   searchQuery.value = ''
   propertyFilter.value = ''
+  resetSort()
   selectedRowIndex.value = -1
   drawerOpen.value = false
+  viewMode.value = 'loading'
   startParsingUrl(url, name)
 }
 
 function onCancel() {
   cancelParsing()
+  // If we have active datasets, go back to viewing them
+  if (activeDatasets.value.length > 0) {
+    viewMode.value = 'viewing'
+  } else {
+    viewMode.value = 'idle'
+  }
 }
 
-function onReset() {
+function onStartNewLoad() {
   resetParser()
   resetColumns()
   searchQuery.value = ''
   propertyFilter.value = ''
+  resetSort()
   selectedRowIndex.value = -1
   drawerOpen.value = false
+  viewMode.value = 'idle'
+}
+
+function onReset() {
+  onStartNewLoad()
 }
 
 function onUpdateMaxRecords(val: number) {
   maxRecords.value = val
+}
+
+// ── Dataset switching ──
+function onSelectDataset(id: string) {
+  selectDataset(id)
+  resetParser()
+  resetColumns()
+  searchQuery.value = ''
+  propertyFilter.value = ''
+  resetSort()
+  viewMode.value = 'viewing'
+}
+
+function onToggleDataset(id: string) {
+  toggleDataset(id)
+  if (activeIds.value.length === 0) {
+    resetParser()
+    resetColumns()
+    viewMode.value = 'idle'
+  } else {
+    resetColumns()
+    searchQuery.value = ''
+    propertyFilter.value = ''
+    resetSort()
+    viewMode.value = 'viewing'
+  }
+}
+
+async function onRemoveDataset(id: string) {
+  await removeDataset(id)
+  if (activeIds.value.length === 0) {
+    resetParser()
+    resetColumns()
+    viewMode.value = 'idle'
+  } else {
+    resetColumns()
+  }
+}
+
+function onSort(column: string) {
+  setSort(column)
 }
 
 // ── Keyboard shortcuts ──
@@ -117,12 +268,21 @@ function onKeydown(e: KeyboardEvent) {
   }
 }
 
-onMounted(() => window.addEventListener('keydown', onKeydown))
-onBeforeUnmount(() => { window.removeEventListener('keydown', onKeydown); disposeSearch() })
+// ── Lifecycle ──
+onMounted(() => {
+  window.addEventListener('keydown', onKeydown)
 
-const isDataReady = computed(() =>
-  state.value === 'loaded' || (state.value === 'loading' && dbRecordCount.value > 0)
-)
+  // Restore persisted datasets
+  initDatasets()
+  if (activeDatasets.value.length > 0) {
+    viewMode.value = 'viewing'
+  }
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeydown)
+  disposeSearch()
+})
 </script>
 
 <template>
@@ -135,12 +295,12 @@ const isDataReady = computed(() =>
           JSON Visualizer
         </h1>
 
-        <!-- Search (when data available) -->
+        <!-- Search + property filter (when data available) -->
         <template v-if="isDataReady">
           <SearchBar
             v-model="searchQuery"
             :match-count="matchCount"
-            :total-count="dbRecordCount"
+            :total-count="displayRecordCount"
             :search-time="searchTime"
             :is-searching="isSearching"
           />
@@ -154,7 +314,7 @@ const isDataReady = computed(() =>
             >
               <option value="">All properties</option>
               <option v-for="key in allKeysList" :key="key" :value="key">
-                {{ key }}
+                {{ formatColumnName(key) }}
               </option>
             </select>
             <span v-if="propertyFilter" class="text-[10px] text-gray-400 dark:text-gray-500 whitespace-nowrap">has value</span>
@@ -162,17 +322,25 @@ const isDataReady = computed(() =>
         </template>
 
         <div class="ml-auto flex items-center gap-1">
+          <!-- Dataset manager -->
+          <DatasetManager
+            v-if="datasets.length > 0"
+            :datasets="datasets"
+            :active-ids="activeIds"
+            @select="onSelectDataset"
+            @toggle="onToggleDataset"
+            @remove="onRemoveDataset"
+          />
+
           <!-- Dark mode toggle -->
           <button
             class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors text-gray-500 dark:text-gray-400"
             :title="isDark ? 'Switch to light mode' : 'Switch to dark mode'"
             @click="toggleTheme"
           >
-            <!-- Sun icon (shown in dark mode) -->
             <svg v-if="isDark" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
               <path stroke-linecap="round" stroke-linejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
             </svg>
-            <!-- Moon icon (shown in light mode) -->
             <svg v-else class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
               <path stroke-linecap="round" stroke-linejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
             </svg>
@@ -192,34 +360,34 @@ const isDataReady = computed(() =>
         </div>
       </div>
 
-      <!-- File summary bar (only when loaded) -->
-      <template v-if="state === 'loaded'">
-        <FileLoader
-          :state="state"
-          :progress="progress"
-          :bytes-read="bytesRead"
-          :total-bytes="totalBytes"
-          :records-parsed="recordsParsed"
-          :file-name="fileName"
-          :error-count="errors.length"
-          :limit-reached="limitReached"
-          :max-records="maxRecords"
-          @load="onLoadFile"
-          @load-url="onLoadUrl"
-          @cancel="onCancel"
-          @reset="onReset"
-          @update:max-records="onUpdateMaxRecords"
-        />
+      <!-- File summary bar (viewing mode) -->
+      <template v-if="viewMode === 'viewing'">
+        <div class="flex items-center gap-4 px-4 py-2 text-sm border-t border-gray-100 dark:border-gray-800">
+          <span class="font-medium text-gray-700 dark:text-gray-300">{{ displayFileName }}</span>
+          <span class="text-gray-500 dark:text-gray-400">{{ displayRecordCount.toLocaleString() }} records</span>
+          <span v-if="limitReached" class="text-amber-600 dark:text-amber-400 text-xs font-medium">
+            Limit reached ({{ maxRecords.toLocaleString() }})
+          </span>
+          <span v-if="errors.length > 0" class="text-amber-600 dark:text-amber-400">
+            {{ errors.length }} error{{ errors.length > 1 ? 's' : '' }}
+          </span>
+          <button
+            class="ml-auto px-3 py-1 text-xs bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors"
+            @click="onStartNewLoad"
+          >
+            Load Another
+          </button>
+        </div>
       </template>
     </header>
 
     <!-- Main content -->
     <div class="flex-1 flex min-h-0">
       <!-- Empty state -->
-      <template v-if="state === 'idle'">
+      <template v-if="viewMode === 'idle'">
         <div class="flex-1 flex items-center justify-center">
           <FileLoader
-            :state="state"
+            :state="'idle'"
             :progress="0"
             :bytes-read="0"
             :total-bytes="0"
@@ -237,7 +405,7 @@ const isDataReady = computed(() =>
         </div>
       </template>
 
-      <!-- Data view -->
+      <!-- Data view (loading or viewing) -->
       <template v-else>
         <!-- Left sidebar -->
         <Transition name="sidebar">
@@ -263,11 +431,16 @@ const isDataReady = computed(() =>
         <main class="flex-1 min-w-0 flex flex-col">
           <PaginatedTable
             v-if="isDataReady"
-            :record-count="dbRecordCount"
+            :record-count="displayRecordCount"
             :columns="visibleColumns"
-            :filtered-indices="matchingIndices"
-            :is-loading="state === 'loading'"
+            :filtered-indices="displayIndices"
+            :is-loading="viewMode === 'loading'"
+            :dataset-ranges="effectiveRanges"
+            :sort-column="sortColumn"
+            :sort-direction="sortDirection"
+            :is-sorting="isSorting"
             @select-row="onSelectRow"
+            @sort="onSort"
           />
         </main>
       </template>
@@ -284,19 +457,19 @@ const isDataReady = computed(() =>
 
     <!-- Loading footer -->
     <LoadingFooter
-      v-if="state === 'loading'"
+      v-if="viewMode === 'loading'"
       :progress="progress"
       :bytes-read="bytesRead"
       :total-bytes="totalBytes"
       :records-parsed="recordsParsed"
-      :file-name="fileName"
+      :file-name="parserFileName"
       @cancel="onCancel"
     />
 
     <!-- Error toast -->
     <Transition name="fade">
       <div
-        v-if="errors.length > 0 && state === 'loaded'"
+        v-if="errors.length > 0 && viewMode === 'viewing'"
         class="fixed bottom-4 right-4 bg-amber-50 dark:bg-amber-950/80 border border-amber-200 dark:border-amber-800 rounded-xl shadow-lg p-4 max-w-sm z-30"
       >
         <div class="flex items-start gap-2">
@@ -308,7 +481,7 @@ const isDataReady = computed(() =>
               {{ errors.length }} parse error{{ errors.length > 1 ? 's' : '' }}
             </p>
             <p class="text-xs text-amber-600 dark:text-amber-400 mt-0.5">
-              {{ errors[0]?.message }}
+              {{ errors[0]?.message || 'Some records could not be parsed' }}
             </p>
           </div>
         </div>

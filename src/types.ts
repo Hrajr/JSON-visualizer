@@ -21,12 +21,31 @@ export interface ParseError {
   message: string
 }
 
+/** Metadata describing a loaded dataset (persisted to localStorage). */
+export interface DatasetInfo {
+  id: string
+  dbName: string
+  fileName: string
+  recordCount: number
+  keys: string[]
+  totalBytes: number
+  loadedAt: number
+}
+
+/** Offset range for a dataset in the combined multi-dataset view. */
+export interface DatasetRange {
+  id: string
+  dbName: string
+  offset: number
+  count: number
+}
+
 /* ── Worker message types ── */
 
 /** Messages sent TO the parser worker */
 export type ParserWorkerInMessage =
-  | { type: 'start'; file: File; batchSize: number; maxRecords: number }
-  | { type: 'start-url'; url: string; batchSize: number; maxRecords: number }
+  | { type: 'start'; file: File; batchSize: number; maxRecords: number; dbName: string }
+  | { type: 'start-url'; url: string; batchSize: number; maxRecords: number; dbName: string }
   | { type: 'cancel' }
 
 /** Messages sent FROM the parser worker */
@@ -41,12 +60,14 @@ export type ParserWorkerOutMessage =
 
 /** Messages sent TO the search worker */
 export type SearchWorkerInMessage =
-  | { type: 'search'; query: string; propertyFilter: string }
+  | { type: 'search'; query: string; propertyFilter: string; datasets: DatasetRange[] }
+  | { type: 'sort'; column: string; direction: 'asc' | 'desc'; indices: number[] | null; datasets: DatasetRange[] }
   | { type: 'cancel' }
 
 /** Messages sent FROM the search worker */
 export type SearchWorkerOutMessage =
-  | { type: 'result'; matchingIndices: number[]; timeTaken: number }
+  | { type: 'result'; matchingIndices: number[] | null; timeTaken: number }
+  | { type: 'sort-result'; sortedIndices: number[]; timeTaken: number }
   | { type: 'progress'; scanned: number }
   | { type: 'cancelled' }
 

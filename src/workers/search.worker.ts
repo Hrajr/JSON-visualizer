@@ -1,132 +1,235 @@
 /**
- * Search Web Worker
+ * Search & Sort Web Worker
  *
- * Opens the same IndexedDB that the parser writes to and scans the lightweight
- * "meta" store (search-string + non-empty-key list per record).
+ * Searches IndexedDB META stores across multiple dataset databases.
+ * Supports text query, property filter, and column-based sorting.
+ * All IDB access happens inside this worker to avoid blocking the main thread.
  *
- * Supports:
- *   - Text query  (AND-matched terms against the search string)
- *   - Property filter  (records that have a non-empty value for a given key)
- *   - Combined query + property filter
- *   - Progress reporting every 50 000 records
- *   - Cancellation between getAll() chunks
+ * Uses operation IDs to handle cancellation correctly when async tasks overlap.
  */
 
-const DB_NAME = 'json-visualizer-db'
+import type { DatasetRange } from '../types'
+
 const DB_VERSION = 1
+const RECORDS_STORE = 'records'
 const META_STORE = 'meta'
-const SCAN_CHUNK = 20_000
+const SCAN_CHUNK = 50_000
 
-let cancelled = false
-let dbInstance: IDBDatabase | null = null
+let currentOpId = 0
+const dbCache = new Map<string, IDBDatabase>()
 
-function openSearchDB(): Promise<IDBDatabase> {
-  if (dbInstance) return Promise.resolve(dbInstance)
+function openDB(name: string): Promise<IDBDatabase> {
+  const cached = dbCache.get(name)
+  if (cached) return Promise.resolve(cached)
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION)
+    const req = indexedDB.open(name, DB_VERSION)
     req.onupgradeneeded = () => {
-      const db = req.result
-      if (!db.objectStoreNames.contains('records')) db.createObjectStore('records')
-      if (!db.objectStoreNames.contains(META_STORE)) db.createObjectStore(META_STORE)
+      const d = req.result
+      if (!d.objectStoreNames.contains(RECORDS_STORE)) d.createObjectStore(RECORDS_STORE)
+      if (!d.objectStoreNames.contains(META_STORE)) d.createObjectStore(META_STORE)
     }
-    req.onsuccess = () => { dbInstance = req.result; resolve(dbInstance) }
+    req.onsuccess = () => { dbCache.set(name, req.result); resolve(req.result) }
     req.onerror = () => reject(req.error)
   })
 }
 
-function idbReq<T>(r: IDBRequest<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    r.onsuccess = () => resolve(r.result)
-    r.onerror = () => reject(r.error)
-  })
-}
+// ── Search ──
 
-async function search(query: string, propertyFilter: string) {
-  const db = await openSearchDB()
-  const start = performance.now()
-
-  const lowerQuery = query.toLowerCase().trim()
-  const terms = lowerQuery ? lowerQuery.split(/\s+/).filter(Boolean) : []
+async function searchDataset(
+  dbName: string,
+  offset: number,
+  terms: string[],
+  propNeedle: string,
+  opId: number,
+): Promise<number[]> {
+  const db = await openDB(dbName)
   const hasQuery = terms.length > 0
-  const hasPropFilter = propertyFilter.length > 0
-
-  if (!hasQuery && !hasPropFilter) {
-    // Nothing to filter – tell caller to show everything
-    self.postMessage({ type: 'result', matchingIndices: null, timeTaken: 0 })
-    return
-  }
-
-  const propNeedle = hasPropFilter ? '\t' + propertyFilter + '\t' : ''
-  const matchingIndices: number[] = []
-  let scanned = 0
+  const hasProp = propNeedle.length > 0
+  const matches: number[] = []
   let nextKey: IDBValidKey = 0
 
   while (true) {
-    if (cancelled) { self.postMessage({ type: 'cancelled' }); return }
+    if (opId !== currentOpId) return matches
 
-    // Read a chunk – both keys and values in one transaction
     const range = IDBKeyRange.lowerBound(nextKey)
-    const keys: IDBValidKey[] = await new Promise((resolve, reject) => {
+
+    // Read keys and values in the SAME transaction for performance
+    const { keys, values } = await new Promise<{
+      keys: IDBValidKey[]
+      values: { s: string; k: string }[]
+    }>((resolve, reject) => {
       const tx = db.transaction(META_STORE, 'readonly')
       const store = tx.objectStore(META_STORE)
       const kr = store.getAllKeys(range, SCAN_CHUNK)
-      kr.onsuccess = () => resolve(kr.result)
-      kr.onerror = () => reject(kr.error)
-    })
-    const values: { s: string; k: string }[] = await new Promise((resolve, reject) => {
-      const tx = db.transaction(META_STORE, 'readonly')
-      const store = tx.objectStore(META_STORE)
       const vr = store.getAll(range, SCAN_CHUNK)
-      vr.onsuccess = () => resolve(vr.result)
-      vr.onerror = () => reject(vr.error)
+      let k: IDBValidKey[] | null = null
+      let v: { s: string; k: string }[] | null = null
+      kr.onsuccess = () => { k = kr.result; if (v) resolve({ keys: k, values: v }) }
+      vr.onsuccess = () => { v = vr.result; if (k) resolve({ keys: k!, values: v }) }
+      tx.onerror = () => reject(tx.error)
     })
 
     if (keys.length === 0) break
 
     for (let i = 0; i < keys.length; i++) {
       let match = true
-
       if (hasQuery) {
         const s = values[i].s
         for (let t = 0; t < terms.length; t++) {
           if (!s.includes(terms[t])) { match = false; break }
         }
       }
-
-      if (match && hasPropFilter) {
-        if (!values[i].k.includes(propNeedle)) match = false
-      }
-
-      if (match) matchingIndices.push(keys[i] as number)
+      if (match && hasProp && !values[i].k.includes(propNeedle)) match = false
+      if (match) matches.push((keys[i] as number) + offset)
     }
 
-    scanned += keys.length
     nextKey = (keys[keys.length - 1] as number) + 1
-    self.postMessage({ type: 'progress', scanned })
-
-    if (keys.length < SCAN_CHUNK) break // end of data
+    self.postMessage({ type: 'progress', scanned: matches.length })
+    if (keys.length < SCAN_CHUNK) break
   }
 
-  if (cancelled) { self.postMessage({ type: 'cancelled' }); return }
+  return matches
+}
+
+async function search(query: string, propertyFilter: string, datasets: DatasetRange[], opId: number) {
+  const start = performance.now()
+
+  const lowerQuery = query.toLowerCase().trim()
+  const terms = lowerQuery ? lowerQuery.split(/\s+/).filter(Boolean) : []
+  const hasProp = propertyFilter.length > 0
+
+  if (terms.length === 0 && !hasProp) {
+    if (opId === currentOpId) {
+      self.postMessage({ type: 'result', matchingIndices: null, timeTaken: 0 })
+    }
+    return
+  }
+
+  const propNeedle = hasProp ? '\t' + propertyFilter + '\t' : ''
+  const allMatches: number[] = []
+
+  for (const ds of datasets) {
+    if (opId !== currentOpId) return
+    const dsMatches = await searchDataset(ds.dbName, ds.offset, terms, propNeedle, opId)
+    if (opId !== currentOpId) return
+    allMatches.push(...dsMatches)
+  }
+
+  if (opId !== currentOpId) return
 
   self.postMessage({
     type: 'result',
-    matchingIndices,
+    matchingIndices: allMatches,
     timeTaken: performance.now() - start,
   })
 }
+
+// ── Sort ──
+
+async function sortDataset(
+  dbName: string,
+  offset: number,
+  column: string,
+  indexSet: Set<number> | null,
+  opId: number,
+): Promise<{ absIdx: number; value: unknown }[]> {
+  const db = await openDB(dbName)
+  const pairs: { absIdx: number; value: unknown }[] = []
+  let nextKey: IDBValidKey = 0
+
+  while (true) {
+    if (opId !== currentOpId) return pairs
+
+    const range = IDBKeyRange.lowerBound(nextKey)
+    const { keys, values } = await new Promise<{
+      keys: IDBValidKey[]
+      values: Record<string, unknown>[]
+    }>((resolve, reject) => {
+      const tx = db.transaction(RECORDS_STORE, 'readonly')
+      const store = tx.objectStore(RECORDS_STORE)
+      const kr = store.getAllKeys(range, SCAN_CHUNK)
+      const vr = store.getAll(range, SCAN_CHUNK)
+      let k: IDBValidKey[] | null = null
+      let v: Record<string, unknown>[] | null = null
+      kr.onsuccess = () => { k = kr.result; if (v) resolve({ keys: k, values: v }) }
+      vr.onsuccess = () => { v = vr.result; if (k) resolve({ keys: k!, values: v }) }
+      tx.onerror = () => reject(tx.error)
+    })
+
+    if (keys.length === 0) break
+
+    for (let i = 0; i < keys.length; i++) {
+      const absIdx = (keys[i] as number) + offset
+      if (indexSet && !indexSet.has(absIdx)) continue
+      pairs.push({ absIdx, value: values[i][column] })
+    }
+
+    nextKey = (keys[keys.length - 1] as number) + 1
+    self.postMessage({ type: 'progress', scanned: pairs.length })
+    if (keys.length < SCAN_CHUNK) break
+  }
+
+  return pairs
+}
+
+function compareValues(a: unknown, b: unknown): number {
+  if (a == null && b == null) return 0
+  if (a == null) return 1
+  if (b == null) return -1
+  if (typeof a === 'number' && typeof b === 'number') return a - b
+  if (typeof a === 'boolean' && typeof b === 'boolean') return a === b ? 0 : a ? -1 : 1
+  return String(a).localeCompare(String(b), undefined, { sensitivity: 'base', numeric: true })
+}
+
+async function sort(
+  column: string,
+  direction: 'asc' | 'desc',
+  indices: number[] | null,
+  datasets: DatasetRange[],
+  opId: number,
+) {
+  const start = performance.now()
+  const indexSet = indices ? new Set(indices) : null
+  const allPairs: { absIdx: number; value: unknown }[] = []
+
+  for (const ds of datasets) {
+    if (opId !== currentOpId) return
+    const dsPairs = await sortDataset(ds.dbName, ds.offset, column, indexSet, opId)
+    if (opId !== currentOpId) return
+    allPairs.push(...dsPairs)
+  }
+
+  if (opId !== currentOpId) return
+
+  const mult = direction === 'asc' ? 1 : -1
+  allPairs.sort((a, b) => mult * compareValues(a.value, b.value))
+
+  if (opId !== currentOpId) return
+
+  self.postMessage({
+    type: 'sort-result',
+    sortedIndices: allPairs.map(p => p.absIdx),
+    timeTaken: performance.now() - start,
+  })
+}
+
+// ── Message handler ──
 
 self.onmessage = (e: MessageEvent) => {
   const msg = e.data
 
   if (msg.type === 'cancel') {
-    cancelled = true
+    currentOpId++
     return
   }
 
   if (msg.type === 'search') {
-    cancelled = false
-    const { query, propertyFilter } = msg as { query: string; propertyFilter: string }
-    search(query, propertyFilter)
+    const opId = ++currentOpId
+    search(msg.query, msg.propertyFilter, msg.datasets || [], opId)
+  }
+
+  if (msg.type === 'sort') {
+    const opId = ++currentOpId
+    sort(msg.column, msg.direction, msg.indices, msg.datasets || [], opId)
   }
 }

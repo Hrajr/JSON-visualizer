@@ -1,28 +1,18 @@
 /**
- * useParser – composable that manages the parser worker lifecycle.
+ * useParser – manages the parser worker lifecycle.
  *
- * Supports two modes:
- *   1. File (from file picker / drag-drop)
- *   2. URL  (fetch streaming from public/data/ folder – best for huge files)
- *
- * The parser worker writes records DIRECTLY to IndexedDB inside the worker
- * thread.  No records are ever sent to the main thread, so memory stays
- * constant regardless of file size.
- *
- * The main thread only receives lightweight messages:
- *   - progress   (bytesRead / totalBytes / recordsParsed)
- *   - keys       (newly discovered column names)
- *   - db-flushed (how many records have been committed to IDB)
- *   - error / done / limit-reached / cancelled
+ * Each load creates a new dataset with its own IndexedDB database.
+ * The worker writes directly to IndexedDB – no records on the main thread.
+ * On completion, calls the registered callback with DatasetInfo.
  */
 
 import { ref, shallowRef, computed, type Ref } from 'vue'
-import type { ParseError, AppState } from '../types'
-import { openDB, clearAllStores } from '../utils/db'
+import type { ParseError, AppState, DatasetInfo } from '../types'
+import { generateDatasetId, dbNameForDataset, closeNamedDB } from '../utils/db'
 import ParserWorker from '../workers/parser.worker?worker'
 
 /** Default max records to load (0 = unlimited) */
-const DEFAULT_MAX_RECORDS = 100_000
+const DEFAULT_MAX_RECORDS = 0
 
 export function useParser() {
   const allKeys: Ref<Map<string, number>> = shallowRef(new Map())
@@ -32,18 +22,34 @@ export function useParser() {
   const bytesRead = ref(0)
   const totalBytes = ref(0)
   const recordsParsed = ref(0)
-  /** Number of records actually committed to IndexedDB (available for display). */
   const dbRecordCount = ref(0)
   const fileName = ref('')
   const limitReached = ref(false)
   const maxRecords = ref(DEFAULT_MAX_RECORDS)
+  const currentDbName = ref('')
 
   let worker: Worker | null = null
+  let currentDatasetId = ''
+
+  /** Called when parsing completes successfully. */
+  let onCompleteCallback: ((info: DatasetInfo) => void) | null = null
 
   const progress = computed(() => {
     if (totalBytes.value === 0) return 0
     return Math.round((bytesRead.value / totalBytes.value) * 100)
   })
+
+  function buildDatasetInfo(totalRecords: number): DatasetInfo {
+    return {
+      id: currentDatasetId,
+      dbName: currentDbName.value,
+      fileName: fileName.value,
+      recordCount: totalRecords,
+      keys: Array.from(allKeys.value.keys()),
+      totalBytes: totalBytes.value || bytesRead.value,
+      loadedAt: Date.now(),
+    }
+  }
 
   function setupWorker() {
     if (worker) worker.terminate()
@@ -60,7 +66,6 @@ export function useParser() {
           break
 
         case 'keys': {
-          // Lightweight – just an array of new key names
           const keyMap = new Map(allKeys.value)
           for (const key of msg.keys as string[]) {
             keyMap.set(key, (keyMap.get(key) || 0) + 1)
@@ -70,7 +75,6 @@ export function useParser() {
         }
 
         case 'db-flushed':
-          // Worker committed records to IndexedDB – update the count
           dbRecordCount.value = msg.count as number
           break
 
@@ -78,19 +82,26 @@ export function useParser() {
           errors.value = [...errors.value, msg.error]
           break
 
-        case 'done':
+        case 'done': {
           state.value = 'loaded'
           recordsParsed.value = msg.totalRecords
+          dbRecordCount.value = msg.totalRecords
+          if (onCompleteCallback) onCompleteCallback(buildDatasetInfo(msg.totalRecords))
           break
+        }
 
-        case 'limit-reached':
+        case 'limit-reached': {
           limitReached.value = true
           state.value = 'loaded'
           recordsParsed.value = msg.totalRecords
+          dbRecordCount.value = msg.totalRecords
+          if (onCompleteCallback) onCompleteCallback(buildDatasetInfo(msg.totalRecords))
           break
+        }
 
         case 'cancelled':
           state.value = 'idle'
+          closeNamedDB(currentDbName.value)
           break
       }
     }
@@ -101,9 +112,7 @@ export function useParser() {
     }
   }
 
-  async function resetState() {
-    await openDB()
-    await clearAllStores()
+  function resetState() {
     allKeys.value = new Map()
     errors.value = []
     bytesRead.value = 0
@@ -114,8 +123,11 @@ export function useParser() {
     state.value = 'loading'
   }
 
-  async function startParsing(file: File, batchSize = 200) {
-    await resetState()
+  function startParsing(file: File, batchSize = 200) {
+    currentDatasetId = generateDatasetId()
+    currentDbName.value = dbNameForDataset(currentDatasetId)
+
+    resetState()
     totalBytes.value = file.size
     fileName.value = file.name
 
@@ -125,11 +137,15 @@ export function useParser() {
       file,
       batchSize,
       maxRecords: maxRecords.value,
+      dbName: currentDbName.value,
     })
   }
 
-  async function startParsingUrl(url: string, displayName: string, batchSize = 200) {
-    await resetState()
+  function startParsingUrl(url: string, displayName: string, batchSize = 200) {
+    currentDatasetId = generateDatasetId()
+    currentDbName.value = dbNameForDataset(currentDatasetId)
+
+    resetState()
     fileName.value = displayName
 
     setupWorker()
@@ -138,6 +154,7 @@ export function useParser() {
       url,
       batchSize,
       maxRecords: maxRecords.value,
+      dbName: currentDbName.value,
     })
   }
 
@@ -145,10 +162,8 @@ export function useParser() {
     if (worker) worker.postMessage({ type: 'cancel' })
   }
 
-  async function reset() {
+  function reset() {
     if (worker) { worker.terminate(); worker = null }
-    await openDB()
-    await clearAllStores()
     allKeys.value = new Map()
     errors.value = []
     state.value = 'idle'
@@ -158,6 +173,12 @@ export function useParser() {
     dbRecordCount.value = 0
     fileName.value = ''
     limitReached.value = false
+    currentDatasetId = ''
+    currentDbName.value = ''
+  }
+
+  function onComplete(cb: (info: DatasetInfo) => void) {
+    onCompleteCallback = cb
   }
 
   return {
@@ -172,9 +193,11 @@ export function useParser() {
     fileName,
     limitReached,
     maxRecords,
+    currentDbName,
     startParsing,
     startParsingUrl,
     cancelParsing,
     reset,
+    onComplete,
   }
 }

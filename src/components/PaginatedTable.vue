@@ -2,28 +2,39 @@
 /**
  * PaginatedTable – table with pagination for large datasets.
  *
- * Records are loaded from IndexedDB on demand – only the current page's rows
- * are ever in memory, so even multi-million-row datasets won't crash.
+ * Records are loaded from IndexedDB on demand via multi-dataset
+ * absolute indexing. Only the current page's rows are in memory.
+ *
+ * Supports sortable column headers: click to cycle asc → desc → none.
  */
 import { ref, shallowRef, computed, watch, onMounted } from 'vue'
-import type { JsonRecord, ColumnDef } from '../types'
+import type { JsonRecord, ColumnDef, DatasetRange } from '../types'
 import { formatColumnName } from '../utils/format'
-import { getRecordsByIndices } from '../utils/db'
+import { getRecordsByAbsoluteIndices } from '../utils/db'
 
 const PAGE_SIZE_OPTIONS = [25, 50, 100, 250, 500]
 
 const props = defineProps<{
-  /** Total number of records available in IndexedDB. */
+  /** Total number of records available across active datasets. */
   recordCount: number
   columns: ColumnDef[]
-  /** Filtered indices (null = show all). Comes from search across ALL records. */
+  /** Filtered/sorted indices (null = show all). */
   filteredIndices: number[] | null
   /** When true, adds bottom padding so the fixed loading footer doesn't overlap pagination. */
   isLoading?: boolean
+  /** Dataset ranges for multi-DB record access. */
+  datasetRanges: DatasetRange[]
+  /** Currently sorted column key (empty = no sort). */
+  sortColumn?: string
+  /** Sort direction. */
+  sortDirection?: 'asc' | 'desc'
+  /** Whether a sort operation is in progress. */
+  isSorting?: boolean
 }>()
 
 const emit = defineEmits<{
   (e: 'select-row', index: number): void
+  (e: 'sort', column: string): void
 }>()
 
 const pageSize = ref(100)
@@ -82,7 +93,7 @@ async function loadPage() {
 
   isPageLoading.value = true
   try {
-    const records = await getRecordsByIndices(indices)
+    const records = await getRecordsByAbsoluteIndices(props.datasetRanges, indices)
     if (gen !== loadGeneration) return // stale
     const map = new Map<number, JsonRecord>()
     for (let i = 0; i < indices.length; i++) {
@@ -97,8 +108,11 @@ async function loadPage() {
 // Reload on page / pageSize change
 watch([currentPage, pageSize], loadPage)
 
-// Reload on filter change (currentPage is reset above, but watch may not re-fire if already 1)
+// Reload on filter change
 watch(() => props.filteredIndices, loadPage)
+
+// Reload when dataset ranges change (switching datasets)
+watch(() => props.datasetRanges, loadPage, { deep: true })
 
 // Debounce reload when recordCount grows (during parsing)
 let rcTimer: ReturnType<typeof setTimeout> | null = null
@@ -141,12 +155,40 @@ function onPageSizeChange(e: Event) {
   currentPage.value = 1
 }
 
+function onHeaderClick(column: string) {
+  emit('sort', column)
+}
+
 const startRecord = computed(() => (currentPage.value - 1) * pageSize.value + 1)
 const endRecord = computed(() => Math.min(currentPage.value * pageSize.value, totalRows.value))
 </script>
 
 <template>
   <div class="flex flex-col h-full min-h-0">
+    <!-- Sort indicator bar -->
+    <div
+      v-if="sortColumn || isSorting"
+      class="shrink-0 flex items-center gap-2 px-3 py-1 bg-blue-50 dark:bg-blue-950/30 border-b border-blue-100 dark:border-blue-900/50 text-xs"
+    >
+      <template v-if="isSorting">
+        <svg class="w-3 h-3 animate-spin text-blue-500 shrink-0" viewBox="0 0 24 24" fill="none">
+          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+        </svg>
+        <span class="text-blue-600 dark:text-blue-400">Sorting...</span>
+      </template>
+      <template v-else-if="sortColumn">
+        <span class="text-blue-600 dark:text-blue-400">
+          Sorted by <strong>{{ formatColumnName(sortColumn) }}</strong>
+          {{ sortDirection === 'asc' ? '↑' : '↓' }}
+        </span>
+        <button
+          class="ml-1 text-blue-500 hover:text-blue-700 dark:hover:text-blue-300"
+          @click="emit('sort', sortColumn!)"
+        >clear</button>
+      </template>
+    </div>
+
     <!-- Table container -->
     <div class="flex-1 overflow-auto virtual-table-scroll">
       <table class="w-full border-collapse min-w-max">
@@ -159,7 +201,7 @@ const endRecord = computed(() => Math.min(currentPage.value * pageSize.value, to
             <th
               v-for="col in columns"
               :key="col.key"
-              class="px-2 py-2.5 text-xs font-semibold text-gray-700 dark:text-gray-300 border-b border-r border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 text-left cell-truncate"
+              class="px-2 py-2.5 text-xs font-semibold text-gray-700 dark:text-gray-300 border-b border-r border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 text-left cell-truncate cursor-pointer select-none hover:bg-gray-200/60 dark:hover:bg-gray-700/60 transition-colors"
               :class="col.pinned ? 'sticky z-30' : ''"
               :style="{
                 width: '180px',
@@ -167,9 +209,18 @@ const endRecord = computed(() => Math.min(currentPage.value * pageSize.value, to
                 maxWidth: '180px',
                 ...(col.pinned ? { left: `${64 + columns.filter(c => c.pinned && c.order < col.order).length * 180}px` } : {}),
               }"
-              :title="col.key"
+              :title="`Click to sort by ${col.key}`"
+              @click="onHeaderClick(col.key)"
             >
-              {{ formatColumnName(col.key) }}
+              <div class="flex items-center gap-1">
+                <span class="truncate">{{ formatColumnName(col.key) }}</span>
+                <span
+                  v-if="sortColumn === col.key"
+                  class="shrink-0 text-blue-500 dark:text-blue-400 text-[10px] font-bold"
+                >
+                  {{ sortDirection === 'asc' ? '▲' : '▼' }}
+                </span>
+              </div>
             </th>
           </tr>
         </thead>
