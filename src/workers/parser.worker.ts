@@ -23,7 +23,7 @@
  *   { type: 'cancelled' }
  */
 
-import { extractJsonObjects, buildSearchString } from '../utils/parser'
+import { extractJsonObjects } from '../utils/parser'
 import type { JsonRecord, ParseError } from '../types'
 
 const DB_VERSION = 1
@@ -67,49 +67,21 @@ function clearDB(dbName: string): Promise<void> {
   }))
 }
 
-function writeSubBatch(
-  d: IDBDatabase,
+function writeBatch(
   startIndex: number,
   records: JsonRecord[],
-  searchStrings: string[],
 ): Promise<void> {
+  if (!db) return Promise.reject(new Error('DB not open'))
+  const d = db
   return new Promise((resolve, reject) => {
-    const tx = d.transaction([RECORDS_STORE, META_STORE], 'readwrite')
-    const recStore = tx.objectStore(RECORDS_STORE)
-    const metaStore = tx.objectStore(META_STORE)
-
+    const tx = d.transaction(RECORDS_STORE, 'readwrite')
+    const store = tx.objectStore(RECORDS_STORE)
     for (let i = 0; i < records.length; i++) {
-      const idx = startIndex + i
-      recStore.put(records[i], idx)
-
-      const record = records[i]
-      const nonEmptyKeys = Object.entries(record)
-        .filter(([, v]) => v !== null && v !== undefined && v !== '')
-        .map(([k]) => k)
-      const keysStr = nonEmptyKeys.length > 0 ? '\t' + nonEmptyKeys.join('\t') + '\t' : ''
-      metaStore.put({ s: searchStrings[i], k: keysStr }, idx)
+      store.put(records[i], startIndex + i)
     }
-
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
   })
-}
-
-async function writeBatch(
-  startIndex: number,
-  records: JsonRecord[],
-  searchStrings: string[],
-): Promise<void> {
-  if (!db) throw new Error('DB not open')
-  for (let off = 0; off < records.length; off += IDB_SUB_BATCH) {
-    const end = Math.min(off + IDB_SUB_BATCH, records.length)
-    await writeSubBatch(
-      db,
-      startIndex + off,
-      records.slice(off, end),
-      searchStrings.slice(off, end),
-    )
-  }
 }
 
 // ── JSON repair ──
@@ -171,12 +143,10 @@ interface ParseContext {
   remainder: string
   batchRecords: JsonRecord[]
   batchKeys: Set<string>
-  batchSearchStrings: string[]
   batchStartIndex: number
 }
 
-const IDB_FLUSH_SIZE = 200
-const IDB_SUB_BATCH = 50
+const IDB_FLUSH_SIZE = 500
 
 function createContext(dbName: string, maxRecords: number, totalBytes: number): ParseContext {
   return {
@@ -189,7 +159,6 @@ function createContext(dbName: string, maxRecords: number, totalBytes: number): 
     remainder: '',
     batchRecords: [],
     batchKeys: new Set(),
-    batchSearchStrings: [],
     batchStartIndex: 0,
   }
 }
@@ -199,15 +168,13 @@ async function flushBatch(ctx: ParseContext): Promise<void> {
 
   const keys = Array.from(ctx.batchKeys)
   const records = ctx.batchRecords
-  const ss = ctx.batchSearchStrings
   const startIdx = ctx.batchStartIndex
 
   ctx.batchStartIndex = ctx.recordsParsed
   ctx.batchRecords = []
   ctx.batchKeys = new Set()
-  ctx.batchSearchStrings = []
 
-  await writeBatch(startIdx, records, ss)
+  await writeBatch(startIdx, records)
 
   if (keys.length > 0) {
     self.postMessage({ type: 'keys', keys })
@@ -218,7 +185,6 @@ async function flushBatch(ctx: ParseContext): Promise<void> {
 function addRecord(ctx: ParseContext, record: JsonRecord) {
   ctx.batchRecords.push(record)
   for (const key of Object.keys(record)) ctx.batchKeys.add(key)
-  ctx.batchSearchStrings.push(buildSearchString(record))
   ctx.recordsParsed++
 }
 

@@ -1,7 +1,7 @@
 /**
  * Search & Sort Web Worker
  *
- * Searches IndexedDB META stores across multiple dataset databases.
+ * Searches IndexedDB RECORDS stores across multiple dataset databases.
  * Supports text query, property filter, and column-based sorting.
  * All IDB access happens inside this worker to avoid blocking the main thread.
  *
@@ -35,16 +35,24 @@ function openDB(name: string): Promise<IDBDatabase> {
 
 // ── Search ──
 
+function buildSearchString(record: Record<string, unknown>): string {
+  const parts: string[] = []
+  for (const val of Object.values(record)) {
+    if (val !== null && val !== undefined) parts.push(String(val))
+  }
+  return parts.join(' ').toLowerCase()
+}
+
 async function searchDataset(
   dbName: string,
   offset: number,
   terms: string[],
-  propNeedle: string,
+  propFilter: string,
   opId: number,
 ): Promise<number[]> {
   const db = await openDB(dbName)
   const hasQuery = terms.length > 0
-  const hasProp = propNeedle.length > 0
+  const hasProp = propFilter.length > 0
   const matches: number[] = []
   let nextKey: IDBValidKey = 0
 
@@ -53,17 +61,16 @@ async function searchDataset(
 
     const range = IDBKeyRange.lowerBound(nextKey)
 
-    // Read keys and values in the SAME transaction for performance
     const { keys, values } = await new Promise<{
       keys: IDBValidKey[]
-      values: { s: string; k: string }[]
+      values: Record<string, unknown>[]
     }>((resolve, reject) => {
-      const tx = db.transaction(META_STORE, 'readonly')
-      const store = tx.objectStore(META_STORE)
+      const tx = db.transaction(RECORDS_STORE, 'readonly')
+      const store = tx.objectStore(RECORDS_STORE)
       const kr = store.getAllKeys(range, SCAN_CHUNK)
       const vr = store.getAll(range, SCAN_CHUNK)
       let k: IDBValidKey[] | null = null
-      let v: { s: string; k: string }[] | null = null
+      let v: Record<string, unknown>[] | null = null
       kr.onsuccess = () => { k = kr.result; if (v) resolve({ keys: k, values: v }) }
       vr.onsuccess = () => { v = vr.result; if (k) resolve({ keys: k!, values: v }) }
       tx.onerror = () => reject(tx.error)
@@ -72,14 +79,21 @@ async function searchDataset(
     if (keys.length === 0) break
 
     for (let i = 0; i < keys.length; i++) {
+      const record = values[i]
       let match = true
+
       if (hasQuery) {
-        const s = values[i].s
+        const s = buildSearchString(record)
         for (let t = 0; t < terms.length; t++) {
           if (!s.includes(terms[t])) { match = false; break }
         }
       }
-      if (match && hasProp && !values[i].k.includes(propNeedle)) match = false
+
+      if (match && hasProp) {
+        const val = record[propFilter]
+        if (val === null || val === undefined || val === '') match = false
+      }
+
       if (match) matches.push((keys[i] as number) + offset)
     }
 
@@ -105,12 +119,11 @@ async function search(query: string, propertyFilter: string, datasets: DatasetRa
     return
   }
 
-  const propNeedle = hasProp ? '\t' + propertyFilter + '\t' : ''
   const allMatches: number[] = []
 
   for (const ds of datasets) {
     if (opId !== currentOpId) return
-    const dsMatches = await searchDataset(ds.dbName, ds.offset, terms, propNeedle, opId)
+    const dsMatches = await searchDataset(ds.dbName, ds.offset, terms, propertyFilter, opId)
     if (opId !== currentOpId) return
     allMatches.push(...dsMatches)
   }
