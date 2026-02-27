@@ -67,13 +67,12 @@ function clearDB(dbName: string): Promise<void> {
   }))
 }
 
-function writeBatch(
+function writeSubBatch(
+  d: IDBDatabase,
   startIndex: number,
   records: JsonRecord[],
   searchStrings: string[],
 ): Promise<void> {
-  if (!db) return Promise.reject(new Error('DB not open'))
-  const d = db
   return new Promise((resolve, reject) => {
     const tx = d.transaction([RECORDS_STORE, META_STORE], 'readwrite')
     const recStore = tx.objectStore(RECORDS_STORE)
@@ -94,6 +93,23 @@ function writeBatch(
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
   })
+}
+
+async function writeBatch(
+  startIndex: number,
+  records: JsonRecord[],
+  searchStrings: string[],
+): Promise<void> {
+  if (!db) throw new Error('DB not open')
+  for (let off = 0; off < records.length; off += IDB_SUB_BATCH) {
+    const end = Math.min(off + IDB_SUB_BATCH, records.length)
+    await writeSubBatch(
+      db,
+      startIndex + off,
+      records.slice(off, end),
+      searchStrings.slice(off, end),
+    )
+  }
 }
 
 // ── JSON repair ──
@@ -159,7 +175,8 @@ interface ParseContext {
   batchStartIndex: number
 }
 
-const IDB_FLUSH_SIZE = 500
+const IDB_FLUSH_SIZE = 200
+const IDB_SUB_BATCH = 50
 
 function createContext(dbName: string, maxRecords: number, totalBytes: number): ParseContext {
   return {
