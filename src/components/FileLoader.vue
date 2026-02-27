@@ -1,11 +1,13 @@
 <script setup lang="ts">
 /**
- * FileLoader – file input, drag-and-drop, load-from-data-folder, sample generator, progress.
+ * FileLoader – file input, drag-and-drop, load-from-data-folder, sample generator.
+ * The data folder section auto-discovers .txt files and allows multi-select.
  * Dark-mode aware.
  */
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import type { AppState } from '../types'
 import { generateSampleFile } from '../utils/sample'
+import { useDataFolder } from '../composables/useDataFolder'
 
 const props = defineProps<{
   state: AppState
@@ -21,7 +23,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'load', file: File): void
-  (e: 'load-url', url: string, name: string): void
+  (e: 'load-urls', files: { url: string; name: string }[]): void
   (e: 'cancel'): void
   (e: 'reset'): void
   (e: 'update:maxRecords', val: number): void
@@ -29,8 +31,19 @@ const emit = defineEmits<{
 
 const isDragging = ref(false)
 const sampleCount = ref(500)
-const dataFileName = ref('data.txt')
 const localMaxRecords = ref(props.maxRecords)
+
+const {
+  files: dataFiles,
+  isLoading: isScanning,
+  error: scanError,
+  selectedFiles,
+  hasSelection,
+  refresh: refreshDataFolder,
+  toggleFile,
+  selectAll,
+  deselectAll,
+} = useDataFolder()
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B'
@@ -71,14 +84,21 @@ function loadSample() {
   emit('load', file)
 }
 
-function loadFromDataFolder() {
-  const name = dataFileName.value.trim()
-  if (!name) return
+function loadSelectedFiles() {
+  if (!hasSelection.value) return
   emit('update:maxRecords', localMaxRecords.value)
-  emit('load-url', `/data/${name}`, name)
+  const toLoad = selectedFiles.value.map(name => ({
+    url: `/data/${name}`,
+    name,
+  }))
+  emit('load-urls', toLoad)
 }
 
 const isLoading = computed(() => props.state === 'loading')
+
+onMounted(() => {
+  refreshDataFolder()
+})
 </script>
 
 <template>
@@ -104,27 +124,81 @@ const isLoading = computed(() => props.state === 'loading')
       <input ref="fileInput" type="file" accept=".txt,.json" class="hidden" @change="onFileInput" />
     </div>
 
-    <!-- Load from data folder (for huge files) -->
+    <!-- Data folder file picker -->
     <div class="w-full bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 p-5">
-      <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-1">Load from data folder</h3>
-      <p class="text-xs text-gray-400 dark:text-gray-500 mb-3">
-        For very large files (multi-GB), place the file in <code class="bg-gray-100 dark:bg-gray-800 px-1 rounded">public/data/</code> and load it via streaming fetch. This avoids browser file-picker memory issues.
-      </p>
-      <div class="flex items-center gap-2">
-        <div class="flex-1 relative">
-          <span class="absolute left-3 top-1/2 -translate-y-1/2 text-xs text-gray-400 dark:text-gray-500 select-none">/data/</span>
-          <input
-            v-model="dataFileName"
-            type="text"
-            placeholder="filename.txt"
-            class="w-full pl-12 pr-3 py-2 text-sm border border-gray-200 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-blue-400"
-          />
-        </div>
+      <div class="flex items-center justify-between mb-1">
+        <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300">Load from data folder</h3>
         <button
-          class="px-4 py-2 text-sm font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors whitespace-nowrap"
-          @click="loadFromDataFolder"
+          class="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors text-gray-400 dark:text-gray-500"
+          title="Refresh file list"
+          @click="refreshDataFolder"
         >
-          Load File
+          <svg class="w-4 h-4" :class="{ 'animate-spin': isScanning }" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          </svg>
+        </button>
+      </div>
+      <p class="text-xs text-gray-400 dark:text-gray-500 mb-3">
+        Place .txt files in <code class="bg-gray-100 dark:bg-gray-800 px-1 rounded">public/data/</code> and select one or more to load.
+      </p>
+
+      <!-- Error -->
+      <p v-if="scanError" class="text-xs text-red-500 dark:text-red-400 mb-2">{{ scanError }}</p>
+
+      <!-- File list -->
+      <div v-if="dataFiles.length > 0" class="space-y-1 max-h-48 overflow-y-auto mb-3">
+        <label
+          v-for="f in dataFiles"
+          :key="f.name"
+          class="flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-colors"
+        >
+          <input
+            type="checkbox"
+            :checked="f.selected"
+            class="w-3.5 h-3.5 rounded border-gray-300 dark:border-gray-600 text-blue-600 accent-blue-600 shrink-0"
+            @change="toggleFile(f.name)"
+          />
+          <svg class="w-4 h-4 text-gray-400 dark:text-gray-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+          </svg>
+          <span class="text-sm text-gray-700 dark:text-gray-300 truncate">{{ f.name }}</span>
+        </label>
+      </div>
+
+      <!-- Empty state -->
+      <div v-else-if="!isScanning" class="py-4 text-center">
+        <p class="text-xs text-gray-400 dark:text-gray-500">No .txt files found in <code class="bg-gray-100 dark:bg-gray-800 px-1 rounded">public/data/</code></p>
+      </div>
+
+      <!-- Scanning -->
+      <div v-if="isScanning" class="py-3 text-center">
+        <p class="text-xs text-gray-400 dark:text-gray-500">Scanning...</p>
+      </div>
+
+      <!-- Action buttons -->
+      <div v-if="dataFiles.length > 0" class="flex items-center gap-2">
+        <button
+          class="px-3 py-1.5 text-xs text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
+          @click="selectAll"
+        >
+          Select All
+        </button>
+        <button
+          class="px-3 py-1.5 text-xs text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors"
+          @click="deselectAll"
+        >
+          Deselect All
+        </button>
+        <div class="flex-1"></div>
+        <span v-if="hasSelection" class="text-xs text-gray-400 dark:text-gray-500">
+          {{ selectedFiles.length }} file{{ selectedFiles.length > 1 ? 's' : '' }} selected
+        </span>
+        <button
+          :disabled="!hasSelection"
+          class="px-4 py-1.5 text-sm font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
+          @click="loadSelectedFiles"
+        >
+          Load Selected
         </button>
       </div>
     </div>

@@ -66,6 +66,7 @@ const {
   addDataset,
   selectDataset,
   toggleDataset,
+  setActiveIds,
   removeDataset,
   getRecord: getDatasetRecord,
 } = useDatasets()
@@ -154,6 +155,12 @@ function closeDrawer() {
 const sidebarOpen = ref(true)
 const columnFilterText = ref('')
 
+// ── Multi-file queue ──
+const urlQueue = ref<{ url: string; name: string }[]>([])
+const batchLoadedIds = ref<string[]>([])
+const batchTotal = ref(0)
+const batchDone = computed(() => batchTotal.value - urlQueue.value.length)
+
 // ── Computed states ──
 const isDataReady = computed(() => viewMode.value === 'loading' || viewMode.value === 'viewing')
 
@@ -171,12 +178,32 @@ watch(parserState, (state) => {
 
 // ── Parser completion callback ──
 onParserComplete((info) => {
-  addDataset(info)
+  const isBatch = batchTotal.value > 1
+  addDataset(info, !isBatch) // Don't change active selection during batch
+  batchLoadedIds.value.push(info.id)
+
+  // If there are more files in the queue, start the next one
+  if (urlQueue.value.length > 0) {
+    const next = urlQueue.value.shift()!
+    startParsingUrl(next.url, next.name)
+    return
+  }
+
+  // All files loaded – activate all batch-loaded datasets
+  if (isBatch) {
+    setActiveIds([...batchLoadedIds.value])
+  }
+
+  batchTotal.value = 0
+  batchLoadedIds.value = []
   viewMode.value = 'viewing'
 })
 
 // ── File loading ──
 function onLoadFile(file: File) {
+  urlQueue.value = []
+  batchLoadedIds.value = []
+  batchTotal.value = 0
   resetColumns()
   searchQuery.value = ''
   propertyFilter.value = ''
@@ -187,19 +214,28 @@ function onLoadFile(file: File) {
   startParsing(file)
 }
 
-function onLoadUrl(url: string, name: string) {
+function onLoadUrls(files: { url: string; name: string }[]) {
+  if (files.length === 0) return
   resetColumns()
   searchQuery.value = ''
   propertyFilter.value = ''
   resetSort()
   selectedRowIndex.value = -1
   drawerOpen.value = false
+
+  // Queue all files, start the first one
+  const [first, ...rest] = files
+  urlQueue.value = rest
+  batchLoadedIds.value = []
+  batchTotal.value = files.length
   viewMode.value = 'loading'
-  startParsingUrl(url, name)
+  startParsingUrl(first.url, first.name)
 }
 
 function onCancel() {
   cancelParsing()
+  urlQueue.value = []
+  batchTotal.value = 0
   // If we have active datasets, go back to viewing them
   if (activeDatasets.value.length > 0) {
     viewMode.value = 'viewing'
@@ -216,6 +252,9 @@ function onStartNewLoad() {
   resetSort()
   selectedRowIndex.value = -1
   drawerOpen.value = false
+  urlQueue.value = []
+  batchTotal.value = 0
+  batchLoadedIds.value = []
   viewMode.value = 'idle'
 }
 
@@ -409,7 +448,7 @@ onBeforeUnmount(() => {
             :limit-reached="false"
             :max-records="maxRecords"
             @load="onLoadFile"
-            @load-url="onLoadUrl"
+            @load-urls="onLoadUrls"
             @cancel="onCancel"
             @reset="onReset"
             @update:max-records="onUpdateMaxRecords"
@@ -474,7 +513,7 @@ onBeforeUnmount(() => {
       :bytes-read="bytesRead"
       :total-bytes="totalBytes"
       :records-parsed="recordsParsed"
-      :file-name="parserFileName"
+      :file-name="batchTotal > 1 ? `[${batchDone + 1}/${batchTotal}] ${parserFileName}` : parserFileName"
       @cancel="onCancel"
     />
 

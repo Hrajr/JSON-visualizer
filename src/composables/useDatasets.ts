@@ -50,12 +50,18 @@ export function useDatasets() {
     activeIds.value = saved.filter(id => datasets.value.some(d => d.id === id))
   }
 
-  /** Register a newly loaded dataset and make it the only active one. */
-  function addDataset(info: DatasetInfo) {
+  /**
+   * Register a newly loaded dataset.
+   * @param activate If true (default), makes it the only active dataset.
+   *                 If false, registers it without changing active selection.
+   */
+  function addDataset(info: DatasetInfo, activate = true) {
     saveDatasetInfo(info)
     datasets.value = getSavedDatasets()
-    activeIds.value = [info.id]
-    saveActiveIds(activeIds.value)
+    if (activate) {
+      activeIds.value = [info.id]
+      saveActiveIds(activeIds.value)
+    }
   }
 
   /** Set exactly one dataset as active. */
@@ -71,6 +77,12 @@ export function useDatasets() {
     } else {
       activeIds.value = [...activeIds.value, id]
     }
+    saveActiveIds(activeIds.value)
+  }
+
+  /** Set the active dataset IDs (replaces current selection). */
+  function setActiveIds(ids: string[]) {
+    activeIds.value = ids.filter(id => datasets.value.some(d => d.id === id))
     saveActiveIds(activeIds.value)
   }
 
@@ -105,6 +117,7 @@ export function useDatasets() {
     addDataset,
     selectDataset,
     toggleDataset,
+    setActiveIds,
     removeDataset,
     getRecord,
     getRecords,
