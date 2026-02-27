@@ -72,9 +72,93 @@ function writeMeta(datasets: DatasetMeta[]): void {
   fs.writeFileSync(META_FILE, JSON.stringify(datasets, null, 2))
 }
 
+/**
+ * Reconstruct metadata for a single .db file by opening it and
+ * reading its records table. Returns null if the file is not a valid
+ * dataset database.
+ */
+function recoverMetaFromDb(dbFile: string): DatasetMeta | null {
+  const id = path.basename(dbFile, '.db')
+  try {
+    const db = getDB(id)
+
+    // Check that records table exists
+    const tableCheck = db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='records'",
+    ).get()
+    if (!tableCheck) return null
+
+    // Get record count
+    const countRow = db.prepare('SELECT COUNT(*) as cnt FROM records').get() as { cnt: number }
+    const recordCount = countRow.cnt
+    if (recordCount === 0) return null
+
+    // Get keys from the first record
+    const firstRow = db.prepare('SELECT data FROM records ORDER BY idx LIMIT 1').get() as
+      | { data: string }
+      | undefined
+    const keys = firstRow ? Object.keys(JSON.parse(firstRow.data)) : []
+
+    // Get file size on disk
+    const dbPath = path.join(DB_DIR, dbFile)
+    const stat = fs.statSync(dbPath)
+
+    return {
+      id,
+      fileName: `${id} (recovered)`,
+      recordCount,
+      keys,
+      totalBytes: stat.size,
+      loadedAt: stat.mtimeMs,
+    }
+  } catch (err) {
+    console.warn(`[SQLite] Could not recover metadata from ${dbFile}:`, err)
+    return null
+  }
+}
+
+/**
+ * Ensure metadata is in sync with actual .db files on disk.
+ * Recovers entries for any .db file that exists but is missing from _meta.json.
+ * This makes the system resilient to _meta.json being deleted/corrupted.
+ */
+function ensureMetaSync(): DatasetMeta[] {
+  const meta = readMeta()
+  const knownIds = new Set(meta.map(m => m.id))
+
+  // Scan for .db files not tracked in _meta.json
+  let dbFiles: string[]
+  try {
+    dbFiles = fs.readdirSync(DB_DIR).filter(f => f.endsWith('.db'))
+  } catch {
+    return meta
+  }
+
+  let changed = false
+  for (const dbFile of dbFiles) {
+    const id = path.basename(dbFile, '.db')
+    if (knownIds.has(id)) continue
+
+    const recovered = recoverMetaFromDb(dbFile)
+    if (recovered) {
+      console.log(`[SQLite] Recovered dataset metadata: ${id} (${recovered.recordCount} records)`)
+      meta.push(recovered)
+      changed = true
+    }
+  }
+
+  // Also remove entries whose .db files no longer exist
+  const existingFiles = new Set(dbFiles.map(f => path.basename(f, '.db')))
+  const cleaned = meta.filter(m => existingFiles.has(m.id))
+  if (cleaned.length !== meta.length) changed = true
+
+  if (changed) writeMeta(cleaned)
+  return cleaned
+}
+
 // ── Public API ──
 
-/** Create a new dataset database with the records table. */
+/** Create a new dataset database with the records table + FTS5 index. */
 export function createDataset(id: string, fileName: string, totalBytes: number): void {
   const db = getDB(id)
   db.exec(`
@@ -84,6 +168,19 @@ export function createDataset(id: string, fileName: string, totalBytes: number):
       search_text TEXT NOT NULL
     )
   `)
+
+  // Contentless FTS5 table for fast full-text search (unicode61 = word tokenizer, case-insensitive)
+  try {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(
+        search_text,
+        content='',
+        tokenize='unicode61'
+      )
+    `)
+  } catch (err) {
+    console.warn('[SQLite] Could not create FTS5 table (may not be supported):', err)
+  }
 
   const meta = readMeta()
   const existing = meta.findIndex(m => m.id === id)
@@ -125,12 +222,21 @@ export function insertRecords(
     'INSERT OR REPLACE INTO records (idx, data, search_text) VALUES (?, ?, ?)',
   )
 
+  // Check if FTS table exists for this database
+  const hasFts = !!db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='records_fts'",
+  ).get()
+  const ftsInsert = hasFts
+    ? db.prepare('INSERT INTO records_fts(rowid, search_text) VALUES (?, ?)')
+    : null
+
   const tx = db.transaction((recs: Record<string, unknown>[]) => {
     for (let i = 0; i < recs.length; i++) {
       const record = recs[i]
       const data = JSON.stringify(record)
       const searchText = buildSearchText(record)
       insert.run(startIndex + i, data, searchText)
+      if (ftsInsert) ftsInsert.run(startIndex + i, searchText)
     }
   })
 
@@ -155,9 +261,9 @@ export function finalizeDataset(
   writeMeta(meta)
 }
 
-/** Get all datasets. */
+/** Get all datasets. Auto-recovers metadata from .db files if _meta.json is missing/incomplete. */
 export function getDatasets(): DatasetMeta[] {
-  return readMeta()
+  return ensureMetaSync()
 }
 
 /** Check if a dataset database file exists. */
@@ -272,15 +378,36 @@ export function getRecordsByAbsoluteIndices(
   return results
 }
 
-/** Search records across multiple datasets. */
+/**
+ * Escape a user search term for safe use in an FTS5 MATCH query.
+ * Wraps in double-quotes (phrase query) and doubles any internal quotes.
+ */
+function escapeFtsTerm(term: string): string {
+  return '"' + term.replace(/"/g, '""') + '"'
+}
+
+/**
+ * Search records across multiple datasets.
+ *
+ * Supports comma-separated multi-value search (AND logic).
+ * E.g. "John, Madrid, 1500" finds records containing ALL three values.
+ * Case-insensitive. Single terms (no comma) work as before.
+ *
+ * Uses FTS5 when available for fast indexed search; falls back to
+ * LIKE-based scanning for legacy databases without an FTS table.
+ */
 export function searchRecords(
   datasets: { id: string; offset: number; count: number }[],
   query: string,
   propertyFilters: string[],
 ): { indices: number[]; timeTaken: number } {
   const start = performance.now()
-  const lowerQuery = query.toLowerCase().trim()
-  const terms = lowerQuery ? lowerQuery.split(/\s+/).filter(Boolean) : []
+  const trimmedQuery = query.trim().toLowerCase()
+
+  // Split by comma for multi-value search, trim each term
+  const terms = trimmedQuery
+    ? trimmedQuery.split(',').map(t => t.trim()).filter(Boolean)
+    : []
 
   if (terms.length === 0 && propertyFilters.length === 0) {
     return { indices: [], timeTaken: 0 }
@@ -292,25 +419,59 @@ export function searchRecords(
     try {
       const db = getDB(ds.id)
 
-      const conditions: string[] = []
-      const params: unknown[] = []
+      // Detect FTS5 table
+      const hasFts = !!db.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='records_fts'",
+      ).get()
 
-      for (const term of terms) {
-        conditions.push('search_text LIKE ?')
-        params.push(`%${term}%`)
-      }
-
+      // Build property-filter conditions (same for both paths)
+      const propConditions: string[] = []
+      const propParams: unknown[] = []
       for (const prop of propertyFilters) {
-        conditions.push(
+        propConditions.push(
           `json_extract(data, ?) IS NOT NULL AND json_extract(data, ?) != '' AND json_extract(data, ?) != 'null'`,
         )
-        params.push(`$.${prop}`, `$.${prop}`, `$.${prop}`)
+        propParams.push(`$.${prop}`, `$.${prop}`, `$.${prop}`)
       }
 
-      const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
-      const sql = `SELECT idx FROM records ${where} ORDER BY idx`
+      let rows: { idx: number }[]
 
-      const rows = db.prepare(sql).all(...params) as { idx: number }[]
+      if (hasFts && terms.length > 0) {
+        // ── Fast path: FTS5 indexed search ──
+        const ftsQuery = terms.map(escapeFtsTerm).join(' ')
+
+        if (propConditions.length === 0) {
+          // Pure FTS search – no join needed
+          rows = db.prepare(
+            'SELECT rowid AS idx FROM records_fts WHERE records_fts MATCH ? ORDER BY rowid',
+          ).all(ftsQuery) as { idx: number }[]
+        } else {
+          // FTS + property filters – join with records table
+          const propWhere = propConditions.join(' AND ')
+          rows = db.prepare(
+            `SELECT r.idx FROM records r
+             WHERE r.idx IN (SELECT rowid FROM records_fts WHERE records_fts MATCH ?)
+               AND ${propWhere}
+             ORDER BY r.idx`,
+          ).all(ftsQuery, ...propParams) as { idx: number }[]
+        }
+      } else {
+        // ── Fallback: LIKE-based scan (no FTS table, or only property filters) ──
+        const conditions: string[] = []
+        const params: unknown[] = []
+
+        for (const term of terms) {
+          conditions.push('search_text LIKE ?')
+          params.push(`%${term}%`)
+        }
+        conditions.push(...propConditions)
+        params.push(...propParams)
+
+        const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+        rows = db.prepare(`SELECT idx FROM records ${where} ORDER BY idx`).all(
+          ...params,
+        ) as { idx: number }[]
+      }
 
       for (const row of rows) {
         allIndices.push(row.idx + ds.offset)
@@ -323,7 +484,13 @@ export function searchRecords(
   return { indices: allIndices, timeTaken: performance.now() - start }
 }
 
-/** Sort records across multiple datasets. */
+/**
+ * Sort records across multiple datasets.
+ *
+ * When `indices` is provided (filtered search results), only those records
+ * are fetched and sorted — NOT the entire 2M-record table. This makes
+ * sorting after a search effectively instant.
+ */
 export function sortRecords(
   datasets: { id: string; offset: number; count: number }[],
   column: string,
@@ -333,18 +500,54 @@ export function sortRecords(
   const start = performance.now()
 
   const pairs: { absIdx: number; value: unknown }[] = []
-  const indexSet = indices ? new Set(indices) : null
 
   for (const ds of datasets) {
     try {
       const db = getDB(ds.id)
-      const sql = `SELECT idx, json_extract(data, ?) as val FROM records ORDER BY idx`
-      const rows = db.prepare(sql).all(`$.${column}`) as { idx: number; val: unknown }[]
 
-      for (const row of rows) {
-        const absIdx = row.idx + ds.offset
-        if (indexSet && !indexSet.has(absIdx)) continue
-        pairs.push({ absIdx, value: row.val })
+      if (indices !== null) {
+        // ── Filtered sort: only query the records we actually need ──
+        const localIndices = indices
+          .filter(i => i >= ds.offset && i < ds.offset + ds.count)
+          .map(i => i - ds.offset)
+
+        if (localIndices.length === 0) continue
+
+        let rows: { idx: number; val: unknown }[]
+
+        if (localIndices.length <= 500) {
+          // Small set – use IN clause
+          const placeholders = localIndices.map(() => '?').join(',')
+          rows = db.prepare(
+            `SELECT idx, json_extract(data, ?) as val FROM records WHERE idx IN (${placeholders})`,
+          ).all(`$.${column}`, ...localIndices) as { idx: number; val: unknown }[]
+        } else {
+          // Larger set – use temp table join
+          db.exec('CREATE TEMP TABLE IF NOT EXISTS _sort_idx (i INTEGER PRIMARY KEY)')
+          db.exec('DELETE FROM _sort_idx')
+          const ins = db.prepare('INSERT INTO _sort_idx VALUES (?)')
+          db.transaction((idxs: number[]) => {
+            for (const i of idxs) ins.run(i)
+          })(localIndices)
+
+          rows = db.prepare(
+            `SELECT r.idx, json_extract(r.data, ?) as val
+             FROM records r INNER JOIN _sort_idx t ON r.idx = t.i`,
+          ).all(`$.${column}`) as { idx: number; val: unknown }[]
+        }
+
+        for (const row of rows) {
+          pairs.push({ absIdx: row.idx + ds.offset, value: row.val })
+        }
+      } else {
+        // ── Unfiltered sort: scan all records ──
+        const rows = db.prepare(
+          `SELECT idx, json_extract(data, ?) as val FROM records ORDER BY idx`,
+        ).all(`$.${column}`) as { idx: number; val: unknown }[]
+
+        for (const row of rows) {
+          pairs.push({ absIdx: row.idx + ds.offset, value: row.val })
+        }
       }
     } catch (err) {
       console.error(`[SQLite] Sort error on dataset ${ds.id}:`, err)

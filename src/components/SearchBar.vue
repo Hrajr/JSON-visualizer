@@ -31,7 +31,7 @@ function onClear() {
         ref="searchInput"
         v-model="query"
         type="text"
-        placeholder="Search records... (Ctrl+F)"
+        placeholder="Search records... separate values with comma (Ctrl+F)"
         class="w-full pl-9 pr-9 py-1.5 text-sm border border-gray-200 dark:border-gray-700/80 rounded-lg
                bg-gray-50 dark:bg-gray-800/50 text-gray-800 dark:text-gray-200
                placeholder-gray-400 dark:placeholder-gray-500
