@@ -5,6 +5,7 @@ dist3
 dist4
 .vite
 *.local
+build-output.txt
 
 # Data files (can be multi-GB)
 public/data/*
