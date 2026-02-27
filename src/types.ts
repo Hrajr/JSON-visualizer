@@ -32,7 +32,8 @@ export type ParserWorkerInMessage =
 /** Messages sent FROM the parser worker */
 export type ParserWorkerOutMessage =
   | { type: 'progress'; bytesRead: number; totalBytes: number; recordsParsed: number }
-  | { type: 'batch'; records: JsonRecord[]; keys: string[]; searchStrings: string[]; startIndex: number }
+  | { type: 'keys'; keys: string[] }
+  | { type: 'db-flushed'; count: number }
   | { type: 'error'; error: ParseError }
   | { type: 'done'; totalRecords: number; totalErrors: number }
   | { type: 'cancelled' }

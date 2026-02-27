@@ -2,8 +2,9 @@
  * Parser Web Worker
  *
  * Reads data from a File object OR a URL (fetch streaming).
- * Parses concatenated JSON objects and sends batches back to main thread.
- * Supports a maxRecords limit to prevent memory exhaustion on huge files.
+ * Parses concatenated JSON objects and writes them DIRECTLY to IndexedDB
+ * inside this worker – records never touch the main thread, keeping memory
+ * usage constant regardless of file size.
  *
  * Messages IN:
  *   { type: 'start', file: File, batchSize: number, maxRecords: number }
@@ -12,7 +13,8 @@
  *
  * Messages OUT:
  *   { type: 'progress', bytesRead, totalBytes, recordsParsed }
- *   { type: 'batch', records, keys, searchStrings, startIndex }
+ *   { type: 'keys', keys: string[] }             — new keys discovered in batch
+ *   { type: 'db-flushed', count: number }         — records committed to IDB
  *   { type: 'error', error: ParseError }
  *   { type: 'done', totalRecords, totalErrors }
  *   { type: 'limit-reached', totalRecords }
@@ -22,7 +24,66 @@
 import { extractJsonObjects, buildSearchString } from '../utils/parser'
 import type { JsonRecord, ParseError } from '../types'
 
+const DB_NAME = 'json-visualizer-db'
+const DB_VERSION = 1
+const RECORDS_STORE = 'records'
+const META_STORE = 'meta'
+
 let cancelled = false
+let db: IDBDatabase | null = null
+
+/** Open IndexedDB inside the worker (workers have full IDB access). */
+function openWorkerDB(): Promise<IDBDatabase> {
+  if (db) return Promise.resolve(db)
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION)
+    req.onupgradeneeded = () => {
+      const d = req.result
+      if (!d.objectStoreNames.contains(RECORDS_STORE)) d.createObjectStore(RECORDS_STORE)
+      if (!d.objectStoreNames.contains(META_STORE)) d.createObjectStore(META_STORE)
+    }
+    req.onsuccess = () => { db = req.result; resolve(db) }
+    req.onerror = () => reject(req.error)
+  })
+}
+
+function clearDB(): Promise<void> {
+  return openWorkerDB().then(d => new Promise((resolve, reject) => {
+    const tx = d.transaction([RECORDS_STORE, META_STORE], 'readwrite')
+    tx.objectStore(RECORDS_STORE).clear()
+    tx.objectStore(META_STORE).clear()
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  }))
+}
+
+/** Write a batch of records + meta to IndexedDB. */
+function writeBatch(
+  startIndex: number,
+  records: JsonRecord[],
+  searchStrings: string[],
+): Promise<void> {
+  return openWorkerDB().then(d => new Promise((resolve, reject) => {
+    const tx = d.transaction([RECORDS_STORE, META_STORE], 'readwrite')
+    const recStore = tx.objectStore(RECORDS_STORE)
+    const metaStore = tx.objectStore(META_STORE)
+
+    for (let i = 0; i < records.length; i++) {
+      const idx = startIndex + i
+      recStore.put(records[i], idx)
+
+      const record = records[i]
+      const nonEmptyKeys = Object.entries(record)
+        .filter(([, v]) => v !== null && v !== undefined && v !== '')
+        .map(([k]) => k)
+      const keysStr = nonEmptyKeys.length > 0 ? '\t' + nonEmptyKeys.join('\t') + '\t' : ''
+      metaStore.put({ s: searchStrings[i], k: keysStr }, idx)
+    }
+
+    tx.oncomplete = () => resolve()
+    tx.onerror = () => reject(tx.error)
+  }))
+}
 
 interface ParseContext {
   batchSize: number
@@ -38,9 +99,12 @@ interface ParseContext {
   batchStartIndex: number
 }
 
+/** How many records to accumulate before flushing to IDB. */
+const IDB_FLUSH_SIZE = 2000
+
 function createContext(batchSize: number, maxRecords: number, totalBytes: number): ParseContext {
   return {
-    batchSize,
+    batchSize: IDB_FLUSH_SIZE, // override caller batchSize – we flush to IDB on our own schedule
     maxRecords,
     totalBytes,
     bytesRead: 0,
@@ -54,32 +118,41 @@ function createContext(batchSize: number, maxRecords: number, totalBytes: number
   }
 }
 
-function flushBatch(ctx: ParseContext) {
+/** Flush accumulated records to IndexedDB and notify main thread. */
+async function flushBatch(ctx: ParseContext): Promise<void> {
   if (ctx.batchRecords.length === 0) return
-  self.postMessage({
-    type: 'batch',
-    records: ctx.batchRecords,
-    keys: Array.from(ctx.batchKeys),
-    searchStrings: ctx.batchSearchStrings,
-    startIndex: ctx.batchStartIndex,
-  })
+
+  const keys = Array.from(ctx.batchKeys)
+  const records = ctx.batchRecords
+  const ss = ctx.batchSearchStrings
+  const startIdx = ctx.batchStartIndex
+
+  // Reset batch state immediately so new records can accumulate
   ctx.batchStartIndex = ctx.recordsParsed
   ctx.batchRecords = []
   ctx.batchKeys = new Set()
   ctx.batchSearchStrings = []
+
+  // Write to IndexedDB (on-disk, no main-thread memory)
+  await writeBatch(startIdx, records, ss)
+
+  // Tell main thread only about new keys (tiny) and how many were committed
+  if (keys.length > 0) {
+    self.postMessage({ type: 'keys', keys })
+  }
+  self.postMessage({ type: 'db-flushed', count: startIdx + records.length })
 }
 
 /** Process a chunk of text data. Returns true if limit reached. */
-function processChunk(ctx: ParseContext, chunk: string, chunkByteLength: number): boolean {
+async function processChunk(ctx: ParseContext, chunk: string, chunkByteLength: number): Promise<boolean> {
   ctx.bytesRead += chunkByteLength
   const text = ctx.remainder + chunk
   const result = extractJsonObjects(text)
   ctx.remainder = result.remainder
 
   for (const jsonStr of result.jsonStrings) {
-    // Check record limit
     if (ctx.maxRecords > 0 && ctx.recordsParsed >= ctx.maxRecords) {
-      flushBatch(ctx)
+      await flushBatch(ctx)
       self.postMessage({ type: 'limit-reached', totalRecords: ctx.recordsParsed })
       return true
     }
@@ -93,8 +166,8 @@ function processChunk(ctx: ParseContext, chunk: string, chunkByteLength: number)
       ctx.batchSearchStrings.push(buildSearchString(record))
       ctx.recordsParsed++
 
-      if (ctx.batchRecords.length >= ctx.batchSize) {
-        flushBatch(ctx)
+      if (ctx.batchRecords.length >= IDB_FLUSH_SIZE) {
+        await flushBatch(ctx)
       }
     } catch (parseErr) {
       ctx.totalErrors++
@@ -107,7 +180,7 @@ function processChunk(ctx: ParseContext, chunk: string, chunkByteLength: number)
     }
   }
 
-  // Send progress
+  // Send progress (lightweight – just numbers)
   self.postMessage({
     type: 'progress',
     bytesRead: ctx.bytesRead,
@@ -118,7 +191,7 @@ function processChunk(ctx: ParseContext, chunk: string, chunkByteLength: number)
   return false
 }
 
-function finalize(ctx: ParseContext) {
+async function finalize(ctx: ParseContext) {
   // Handle any remaining text
   if (ctx.remainder.trim().length > 0) {
     if (ctx.maxRecords <= 0 || ctx.recordsParsed < ctx.maxRecords) {
@@ -142,7 +215,7 @@ function finalize(ctx: ParseContext) {
     }
   }
 
-  flushBatch(ctx)
+  await flushBatch(ctx)
 
   self.postMessage({
     type: 'done',
@@ -152,6 +225,7 @@ function finalize(ctx: ParseContext) {
 }
 
 async function parseFromFile(file: File, batchSize: number, maxRecords: number) {
+  await clearDB()
   const ctx = createContext(batchSize, maxRecords, file.size)
 
   if (typeof file.stream === 'function') {
@@ -164,8 +238,7 @@ async function parseFromFile(file: File, batchSize: number, maxRecords: number) 
         if (cancelled) { reader.cancel(); self.postMessage({ type: 'cancelled' }); return }
         const { done, value } = await reader.read()
         if (done) break
-        const chunk = decoder.decode(value, { stream: true })
-        if (processChunk(ctx, chunk, value.byteLength)) return
+        if (await processChunk(ctx, decoder.decode(value, { stream: true }), value.byteLength)) return
       }
     } catch (err) {
       self.postMessage({ type: 'error', error: {
@@ -183,16 +256,17 @@ async function parseFromFile(file: File, batchSize: number, maxRecords: number) 
       const end = Math.min(offset + CHUNK_SIZE, file.size)
       const blob = file.slice(offset, end)
       const text = await blob.text()
-      if (processChunk(ctx, text, end - offset)) return
+      if (await processChunk(ctx, text, end - offset)) return
       offset = end
     }
   }
 
-  finalize(ctx)
+  await finalize(ctx)
 }
 
 async function parseFromUrl(url: string, batchSize: number, maxRecords: number) {
   try {
+    await clearDB()
     const response = await fetch(url)
     if (!response.ok) {
       self.postMessage({ type: 'error', error: {
@@ -207,10 +281,9 @@ async function parseFromUrl(url: string, batchSize: number, maxRecords: number) 
     const ctx = createContext(batchSize, maxRecords, totalBytes)
 
     if (!response.body) {
-      // No streaming – fallback to reading all text (may fail on huge files)
       const text = await response.text()
-      processChunk(ctx, text, new TextEncoder().encode(text).length)
-      finalize(ctx)
+      await processChunk(ctx, text, new TextEncoder().encode(text).length)
+      await finalize(ctx)
       return
     }
 
@@ -221,11 +294,10 @@ async function parseFromUrl(url: string, batchSize: number, maxRecords: number) 
       if (cancelled) { reader.cancel(); self.postMessage({ type: 'cancelled' }); return }
       const { done, value } = await reader.read()
       if (done) break
-      const chunk = decoder.decode(value, { stream: true })
-      if (processChunk(ctx, chunk, value.byteLength)) { reader.cancel(); return }
+      if (await processChunk(ctx, decoder.decode(value, { stream: true }), value.byteLength)) { reader.cancel(); return }
     }
 
-    finalize(ctx)
+    await finalize(ctx)
   } catch (err) {
     self.postMessage({ type: 'error', error: {
       recordIndex: -1, snippet: '',

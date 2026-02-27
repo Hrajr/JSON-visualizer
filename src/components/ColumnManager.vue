@@ -53,7 +53,7 @@ const filterText = defineModel<string>('filterText', { default: '' })
     <div class="flex-1 overflow-y-auto">
       <template v-for="col in columns" :key="col.key">
         <div
-          v-if="!filterText || col.key.toLowerCase().includes(filterText.toLowerCase())"
+          v-if="!filterText || col.key.toLowerCase().includes(filterText.toLowerCase()) || formatColumnName(col.key).toLowerCase().includes(filterText.toLowerCase())"
           class="flex items-center gap-1.5 px-2.5 py-1.5 hover:bg-gray-50 dark:hover:bg-gray-800 border-b border-gray-100 dark:border-gray-800 group transition-colors"
         >
           <!-- Checkbox -->

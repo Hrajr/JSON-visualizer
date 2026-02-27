@@ -159,10 +159,10 @@ function valueColor(val: unknown): string {
               <div
                 v-for="(entry, idx) in populatedEntries"
                 :key="entry.key"
-                class="grid grid-cols-[minmax(140px,2fr)_minmax(0,3fr)] border-b border-gray-100 dark:border-gray-800 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-800/60 transition-colors"
-                :class="idx % 2 === 0 ? 'bg-white dark:bg-gray-900' : 'bg-gray-50/50 dark:bg-gray-850'"
+                class="grid grid-cols-[minmax(140px,2fr)_minmax(0,3fr)] border-b border-gray-200 dark:border-gray-700 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
+                :class="idx % 2 === 0 ? 'bg-white dark:bg-gray-900' : 'bg-gray-50/50 dark:bg-gray-800/40'"
               >
-                <div class="px-3 py-2 text-xs font-medium text-gray-500 dark:text-gray-400 border-r border-gray-100 dark:border-gray-800 break-words hyphens-auto leading-relaxed">
+                <div class="px-3 py-2 text-xs font-medium text-gray-500 dark:text-gray-300 border-r border-gray-200 dark:border-gray-700 break-words hyphens-auto leading-relaxed">
                   {{ formatColumnName(entry.key) }}
                 </div>
                 <div
@@ -188,7 +188,7 @@ function valueColor(val: unknown): string {
               <span
                 v-for="key in missingEntries"
                 :key="key"
-                class="inline-block text-xs px-2 py-1 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-600 border border-gray-200 dark:border-gray-700"
+                class="inline-block text-xs px-2 py-1 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-400 border border-gray-200 dark:border-gray-700"
               >
                 {{ formatColumnName(key) }}
               </span>
