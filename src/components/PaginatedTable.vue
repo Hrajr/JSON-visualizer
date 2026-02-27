@@ -188,18 +188,18 @@ function pinnedLeft(col: ColumnDef): number {
 
     <!-- Table container -->
     <div class="flex-1 overflow-auto virtual-table-scroll">
-      <table class="w-full border-collapse min-w-max text-[13px] leading-relaxed">
+      <table class="w-full border-collapse min-w-max text-[13px] leading-relaxed table-striped">
         <!-- Sticky header -->
         <thead class="sticky top-0 z-20">
           <tr>
-            <th class="shrink-0 w-16 px-3 py-2 text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider border-b border-r border-gray-200/60 dark:border-gray-700/60 bg-gray-50 dark:bg-gray-800/80 sticky left-0 z-30 text-right">
+            <th class="shrink-0 w-16 px-3 py-2 text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider border-b border-r border-gray-200/60 dark:border-gray-700/60 bg-gray-50/95 dark:bg-gray-800/95 backdrop-blur-sm sticky left-0 z-30 text-right">
               #
             </th>
             <th
               v-for="col in columns"
               :key="col.key"
               draggable="true"
-              class="relative px-3 py-2 text-[10px] font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider border-b border-r border-gray-200/60 dark:border-gray-700/60 bg-gray-50 dark:bg-gray-800/80 text-left cell-truncate cursor-pointer select-none hover:bg-gray-100 dark:hover:bg-gray-700/60 transition-colors group/th"
+              class="relative px-3 py-2 text-[10px] font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider border-b border-r border-gray-200/60 dark:border-gray-700/60 bg-gray-50/95 dark:bg-gray-800/95 backdrop-blur-sm text-left cell-truncate cursor-pointer select-none hover:bg-gray-100 dark:hover:bg-gray-700/60 transition-colors group/th"
               :class="[
                 col.pinned ? 'sticky z-30' : '',
                 dragOverKey === col.key ? 'ring-2 ring-blue-400 ring-inset' : '',
@@ -247,7 +247,7 @@ function pinnedLeft(col: ColumnDef): number {
             class="border-b border-gray-100/80 dark:border-gray-800/60 hover:bg-blue-50/60 dark:hover:bg-blue-950/30 cursor-pointer transition-colors"
             @click="emit('select-row', row.absIndex)"
           >
-            <td class="shrink-0 w-16 px-3 py-1.5 text-[11px] font-mono text-gray-400 dark:text-gray-500 border-r border-gray-100/60 dark:border-gray-800/40 bg-white dark:bg-gray-900 sticky left-0 z-10 text-right tabular-nums">
+            <td class="shrink-0 w-16 px-3 py-1.5 text-[11px] font-mono text-gray-400/80 dark:text-gray-500/80 border-r border-gray-100/60 dark:border-gray-800/40 bg-white dark:bg-gray-900 sticky left-0 z-10 text-right tabular-nums select-none">
               {{ row.absIndex + 1 }}
             </td>
             <td
@@ -274,8 +274,11 @@ function pinnedLeft(col: ColumnDef): number {
       </table>
 
       <!-- Empty state -->
-      <div v-if="totalCount === 0 && !isLoading" class="py-16 text-center text-gray-400 dark:text-gray-600 text-sm">
-        No records to display
+      <div v-if="totalCount === 0 && !isLoading" class="py-20 text-center">
+        <svg class="mx-auto mb-3 w-10 h-10 text-gray-300 dark:text-gray-700" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4" />
+        </svg>
+        <p class="text-sm text-gray-400 dark:text-gray-600">No records to display</p>
       </div>
       <!-- Bottom spacer when loading footer is visible -->
       <div v-if="isLoading" class="h-8 shrink-0"></div>
@@ -284,7 +287,7 @@ function pinnedLeft(col: ColumnDef): number {
     <!-- Pagination footer -->
     <div
       v-if="totalCount > 0"
-      class="shrink-0 flex items-center justify-between gap-4 px-4 py-2.5 border-t border-gray-200/80 dark:border-gray-700/80 bg-white dark:bg-gray-900 text-xs transition-[padding] duration-300"
+      class="shrink-0 flex items-center justify-between gap-4 px-4 py-2.5 border-t border-gray-200/80 dark:border-gray-700/80 bg-white dark:bg-gray-900 text-xs transition-[padding] duration-300 shadow-[0_-1px_3px_-1px_rgb(0,0,0,0.04)] dark:shadow-[0_-1px_3px_-1px_rgb(0,0,0,0.2)]"
       :class="isLoading ? 'pb-8' : ''"
     >
       <!-- Left: page size & info -->
@@ -316,7 +319,7 @@ function pinnedLeft(col: ColumnDef): number {
 
         <template v-for="(pg, idx) in pageRange" :key="idx">
           <span v-if="pg === -1" class="px-1 text-gray-400 dark:text-gray-600 select-none">…</span>
-          <button v-else class="min-w-[24px] h-6 rounded text-center transition-colors" :class="pg === page ? 'bg-blue-600 text-white font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'" @click="goToPage(pg)">{{ pg }}</button>
+          <button v-else class="min-w-[24px] h-6 rounded text-center transition-colors" :class="pg === page ? 'bg-blue-600 text-white font-medium shadow-sm' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'" @click="goToPage(pg)">{{ pg }}</button>
         </template>
 
         <button class="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-gray-500 dark:text-gray-400" :disabled="page === totalPages" title="Next page" @click="goToPage(page + 1)">
