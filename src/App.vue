@@ -8,8 +8,9 @@ import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import FileLoader from './components/FileLoader.vue'
 import SearchBar from './components/SearchBar.vue'
 import ColumnManager from './components/ColumnManager.vue'
-import VirtualTable from './components/VirtualTable.vue'
+import PaginatedTable from './components/PaginatedTable.vue'
 import RowDrawer from './components/RowDrawer.vue'
+import LoadingFooter from './components/LoadingFooter.vue'
 
 import { useParser } from './composables/useParser'
 import { useSearch } from './composables/useSearch'
@@ -171,8 +172,8 @@ const isDataReady = computed(() =>
         </div>
       </div>
 
-      <!-- File progress / info bar -->
-      <template v-if="state !== 'idle'">
+      <!-- File summary bar (only when loaded) -->
+      <template v-if="state === 'loaded'">
         <FileLoader
           :state="state"
           :progress="progress"
@@ -240,22 +241,13 @@ const isDataReady = computed(() =>
 
         <!-- Table -->
         <main class="flex-1 min-w-0 flex flex-col">
-          <VirtualTable
+          <PaginatedTable
             v-if="isDataReady"
             :records="records"
             :columns="visibleColumns"
             :filtered-indices="matchingIndices"
             @select-row="onSelectRow"
           />
-          <div v-else-if="state === 'loading'" class="flex-1 flex items-center justify-center text-gray-400 dark:text-gray-600">
-            <div class="flex items-center gap-2">
-              <svg class="w-5 h-5 animate-spin" viewBox="0 0 24 24" fill="none">
-                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
-                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
-              </svg>
-              <span>Parsing file...</span>
-            </div>
-          </div>
         </main>
       </template>
     </div>
@@ -267,6 +259,17 @@ const isDataReady = computed(() =>
       :open="drawerOpen"
       :all-keys="allKeysList"
       @close="closeDrawer"
+    />
+
+    <!-- Loading footer -->
+    <LoadingFooter
+      v-if="state === 'loading'"
+      :progress="progress"
+      :bytes-read="bytesRead"
+      :total-bytes="totalBytes"
+      :records-parsed="recordsParsed"
+      :file-name="fileName"
+      @cancel="onCancel"
     />
 
     <!-- Error toast -->

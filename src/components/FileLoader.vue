@@ -164,29 +164,6 @@ const isLoading = computed(() => props.state === 'loading')
     </div>
   </div>
 
-  <!-- Loading: progress -->
-  <div v-else-if="state === 'loading'" class="flex flex-col items-center gap-4 p-5">
-    <div class="w-full max-w-lg">
-      <div class="flex items-center justify-between text-sm text-gray-600 dark:text-gray-400 mb-1">
-        <span>Parsing {{ fileName }}...</span>
-        <span>{{ progress }}%</span>
-      </div>
-      <div class="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-        <div class="bg-blue-600 h-2 rounded-full transition-all duration-300" :style="{ width: `${progress}%` }"></div>
-      </div>
-      <div class="flex items-center justify-between text-xs text-gray-500 dark:text-gray-500 mt-2">
-        <span>{{ formatBytes(bytesRead) }} / {{ formatBytes(totalBytes) }}</span>
-        <span>{{ recordsParsed.toLocaleString() }} records parsed</span>
-      </div>
-    </div>
-    <button
-      class="px-4 py-1.5 text-sm bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors"
-      @click="$emit('cancel')"
-    >
-      Cancel
-    </button>
-  </div>
-
   <!-- Loaded: summary bar -->
   <div v-else class="flex items-center gap-4 px-4 py-2 text-sm">
     <span class="font-medium text-gray-700 dark:text-gray-300">{{ fileName }}</span>
