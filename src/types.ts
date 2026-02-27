@@ -40,12 +40,13 @@ export type ParserWorkerOutMessage =
 
 /** Messages sent TO the search worker */
 export type SearchWorkerInMessage =
-  | { type: 'search'; query: string; searchStrings: string[]; indices: number[] }
+  | { type: 'search'; query: string; propertyFilter: string }
   | { type: 'cancel' }
 
 /** Messages sent FROM the search worker */
 export type SearchWorkerOutMessage =
   | { type: 'result'; matchingIndices: number[]; timeTaken: number }
+  | { type: 'progress'; scanned: number }
   | { type: 'cancelled' }
 
 /** Application state enum */

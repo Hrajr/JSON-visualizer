@@ -1,10 +1,10 @@
 <script setup lang="ts">
 /**
  * App.vue – Root component.
- * Wires FileLoader, SearchBar, ColumnManager, VirtualTable, RowDrawer.
- * Includes dark/light mode toggle and keyboard shortcuts.
+ * Wires FileLoader, SearchBar, ColumnManager, PaginatedTable, RowDrawer.
+ * Records live in IndexedDB – only one page of data is in memory at a time.
  */
-import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import FileLoader from './components/FileLoader.vue'
 import SearchBar from './components/SearchBar.vue'
 import ColumnManager from './components/ColumnManager.vue'
@@ -16,14 +16,16 @@ import { useParser } from './composables/useParser'
 import { useSearch } from './composables/useSearch'
 import { useColumns } from './composables/useColumns'
 import { useTheme } from './composables/useTheme'
+import { getRecord } from './utils/db'
+import type { JsonRecord } from './types'
 
 // ── Theme ──
 const { isDark, toggle: toggleTheme } = useTheme()
 
-// ── Parser ──
+// ── Parser (IndexedDB-backed) ──
 const {
-  records, searchStrings, allKeys, errors, state,
-  bytesRead, totalBytes, recordsParsed, progress, fileName,
+  allKeys, errors, state,
+  bytesRead, totalBytes, recordsParsed, dbRecordCount, progress, fileName,
   limitReached, maxRecords,
   startParsing, startParsingUrl, cancelParsing, reset: resetParser,
 } = useParser()
@@ -36,40 +38,27 @@ const {
   reset: resetColumns,
 } = useColumns(allKeys)
 
-// ── Search ──
-const totalRecordCount = computed(() => records.value.length)
+// ── Search (reads IndexedDB directly via worker) ──
 const {
-  query: searchQuery, matchingIndices, matchCount, searchTime, isSearching,
+  query: searchQuery,
+  propertyFilter,
+  matchingIndices, matchCount, searchTime, isSearching,
   dispose: disposeSearch,
-} = useSearch(searchStrings, totalRecordCount)
-
-// ── Property filter (non-empty filter) ──
-const propertyFilter = ref<string>('')
-
-const propertyFilteredIndices = computed(() => {
-  if (!propertyFilter.value) return matchingIndices.value
-  const key = propertyFilter.value
-  const source = matchingIndices.value ?? Array.from({ length: records.value.length }, (_, i) => i)
-  return source.filter(i => {
-    const val = records.value[i]?.[key]
-    return val !== null && val !== undefined && val !== ''
-  })
-})
+} = useSearch(dbRecordCount)
 
 // ── Row drawer ──
 const selectedRowIndex = ref<number>(-1)
 const drawerOpen = ref(false)
-
-const selectedRecord = computed(() => {
-  if (selectedRowIndex.value < 0 || selectedRowIndex.value >= records.value.length) return null
-  return records.value[selectedRowIndex.value]
-})
+const selectedRecord = ref<JsonRecord | null>(null)
 
 const allKeysList = computed(() => Array.from(allKeys.value.keys()))
 
-function onSelectRow(index: number) {
+async function onSelectRow(index: number) {
   selectedRowIndex.value = index
   drawerOpen.value = true
+  selectedRecord.value = null
+  const rec = await getRecord(index)
+  selectedRecord.value = rec ?? null
 }
 
 function closeDrawer() {
@@ -84,6 +73,7 @@ const columnFilterText = ref('')
 function onLoadFile(file: File) {
   resetColumns()
   searchQuery.value = ''
+  propertyFilter.value = ''
   selectedRowIndex.value = -1
   drawerOpen.value = false
   startParsing(file)
@@ -92,6 +82,7 @@ function onLoadFile(file: File) {
 function onLoadUrl(url: string, name: string) {
   resetColumns()
   searchQuery.value = ''
+  propertyFilter.value = ''
   selectedRowIndex.value = -1
   drawerOpen.value = false
   startParsingUrl(url, name)
@@ -130,7 +121,7 @@ onMounted(() => window.addEventListener('keydown', onKeydown))
 onBeforeUnmount(() => { window.removeEventListener('keydown', onKeydown); disposeSearch() })
 
 const isDataReady = computed(() =>
-  state.value === 'loaded' || (state.value === 'loading' && records.value.length > 0)
+  state.value === 'loaded' || (state.value === 'loading' && dbRecordCount.value > 0)
 )
 </script>
 
@@ -149,7 +140,7 @@ const isDataReady = computed(() =>
           <SearchBar
             v-model="searchQuery"
             :match-count="matchCount"
-            :total-count="records.length"
+            :total-count="dbRecordCount"
             :search-time="searchTime"
             :is-searching="isSearching"
           />
@@ -272,9 +263,9 @@ const isDataReady = computed(() =>
         <main class="flex-1 min-w-0 flex flex-col">
           <PaginatedTable
             v-if="isDataReady"
-            :records="records"
+            :record-count="dbRecordCount"
             :columns="visibleColumns"
-            :filtered-indices="propertyFilteredIndices"
+            :filtered-indices="matchingIndices"
             :is-loading="state === 'loading'"
             @select-row="onSelectRow"
           />

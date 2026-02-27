@@ -5,20 +5,23 @@
  *   1. File (from file picker / drag-drop)
  *   2. URL  (fetch streaming from public/data/ folder – best for huge files)
  *
- * Records are stored with shallowRef + markRaw to avoid deep reactivity overhead.
- * A configurable maxRecords limit prevents memory exhaustion on multi-GB files.
+ * Records are written to IndexedDB (on disk) instead of held in a JS array,
+ * so even 10 GB+ files won't crash the browser.
+ * Only lightweight metadata (allKeys, error list, counts) stays in memory.
  */
 
-import { ref, shallowRef, computed, markRaw, type Ref } from 'vue'
+import { ref, shallowRef, computed, type Ref } from 'vue'
 import type { JsonRecord, ParseError, AppState, ParserWorkerOutMessage } from '../types'
+import { openDB, clearAllStores, addBatch } from '../utils/db'
 import ParserWorker from '../workers/parser.worker?worker'
 
 /** Default max records to load (0 = unlimited) */
 const DEFAULT_MAX_RECORDS = 100_000
 
+/** Accumulate this many records before flushing to IndexedDB for write performance. */
+const DB_WRITE_BATCH = 2000
+
 export function useParser() {
-  const records: Ref<JsonRecord[]> = shallowRef([])
-  const searchStrings: Ref<string[]> = shallowRef([])
   const allKeys: Ref<Map<string, number>> = shallowRef(new Map())
   const errors: Ref<ParseError[]> = ref([])
 
@@ -26,16 +29,38 @@ export function useParser() {
   const bytesRead = ref(0)
   const totalBytes = ref(0)
   const recordsParsed = ref(0)
+  /** Number of records actually committed to IndexedDB (available for display). */
+  const dbRecordCount = ref(0)
   const fileName = ref('')
   const limitReached = ref(false)
   const maxRecords = ref(DEFAULT_MAX_RECORDS)
 
   let worker: Worker | null = null
 
+  // ── Write-accumulator ──
+  let pendingRecords: JsonRecord[] = []
+  let pendingSearchStrings: string[] = []
+  let pendingStartIndex = 0
+  /** Sequential write-chain so IndexedDB transactions never overlap. */
+  let writeChain: Promise<void> = Promise.resolve()
+
   const progress = computed(() => {
     if (totalBytes.value === 0) return 0
     return Math.round((bytesRead.value / totalBytes.value) * 100)
   })
+
+  function flushPending(): Promise<void> {
+    if (pendingRecords.length === 0) return Promise.resolve()
+    const batch = pendingRecords
+    const ss = pendingSearchStrings
+    const start = pendingStartIndex
+    pendingStartIndex += batch.length
+    pendingRecords = []
+    pendingSearchStrings = []
+    return addBatch(start, batch, ss).then(() => {
+      dbRecordCount.value = start + batch.length
+    })
+  }
 
   function setupWorker() {
     if (worker) worker.terminate()
@@ -52,19 +77,15 @@ export function useParser() {
           break
 
         case 'batch': {
-          const newRecords = msg.records.map((r) => markRaw(r))
-          const currentRecords = records.value
-          const merged = new Array(currentRecords.length + newRecords.length)
-          for (let i = 0; i < currentRecords.length; i++) merged[i] = currentRecords[i]
-          for (let i = 0; i < newRecords.length; i++) merged[currentRecords.length + i] = newRecords[i]
-          records.value = merged
+          // Accumulate records for a larger IndexedDB write
+          pendingRecords.push(...msg.records)
+          pendingSearchStrings.push(...msg.searchStrings)
 
-          const currentSearchStrings = searchStrings.value
-          const mergedSS = new Array(currentSearchStrings.length + msg.searchStrings.length)
-          for (let i = 0; i < currentSearchStrings.length; i++) mergedSS[i] = currentSearchStrings[i]
-          for (let i = 0; i < msg.searchStrings.length; i++) mergedSS[currentSearchStrings.length + i] = msg.searchStrings[i]
-          searchStrings.value = mergedSS
+          if (pendingRecords.length >= DB_WRITE_BATCH) {
+            writeChain = writeChain.then(() => flushPending())
+          }
 
+          // Update allKeys in memory (small footprint)
           const keyMap = new Map(allKeys.value)
           for (const key of msg.keys) {
             keyMap.set(key, (keyMap.get(key) || 0) + 1)
@@ -78,14 +99,23 @@ export function useParser() {
           break
 
         case 'done':
-          state.value = 'loaded'
-          recordsParsed.value = msg.totalRecords
+          // Flush remaining records, then mark loaded
+          writeChain = writeChain
+            .then(() => flushPending())
+            .then(() => {
+              state.value = 'loaded'
+              recordsParsed.value = msg.totalRecords
+            })
           break
 
         case 'limit-reached':
-          limitReached.value = true
-          state.value = 'loaded'
-          recordsParsed.value = msg.totalRecords
+          writeChain = writeChain
+            .then(() => flushPending())
+            .then(() => {
+              limitReached.value = true
+              state.value = 'loaded'
+              recordsParsed.value = msg.totalRecords
+            })
           break
 
         case 'cancelled':
@@ -100,20 +130,25 @@ export function useParser() {
     }
   }
 
-  function resetState() {
-    records.value = []
-    searchStrings.value = []
+  async function resetState() {
+    await openDB()
+    await clearAllStores()
     allKeys.value = new Map()
     errors.value = []
     bytesRead.value = 0
     totalBytes.value = 0
     recordsParsed.value = 0
+    dbRecordCount.value = 0
     limitReached.value = false
+    pendingRecords = []
+    pendingSearchStrings = []
+    pendingStartIndex = 0
+    writeChain = Promise.resolve()
     state.value = 'loading'
   }
 
-  function startParsing(file: File, batchSize = 200) {
-    resetState()
+  async function startParsing(file: File, batchSize = 200) {
+    await resetState()
     totalBytes.value = file.size
     fileName.value = file.name
 
@@ -126,8 +161,8 @@ export function useParser() {
     })
   }
 
-  function startParsingUrl(url: string, displayName: string, batchSize = 200) {
-    resetState()
+  async function startParsingUrl(url: string, displayName: string, batchSize = 200) {
+    await resetState()
     fileName.value = displayName
 
     setupWorker()
@@ -143,29 +178,33 @@ export function useParser() {
     if (worker) worker.postMessage({ type: 'cancel' })
   }
 
-  function reset() {
+  async function reset() {
     if (worker) { worker.terminate(); worker = null }
-    records.value = []
-    searchStrings.value = []
+    await openDB()
+    await clearAllStores()
     allKeys.value = new Map()
     errors.value = []
     state.value = 'idle'
     bytesRead.value = 0
     totalBytes.value = 0
     recordsParsed.value = 0
+    dbRecordCount.value = 0
     fileName.value = ''
     limitReached.value = false
+    pendingRecords = []
+    pendingSearchStrings = []
+    pendingStartIndex = 0
+    writeChain = Promise.resolve()
   }
 
   return {
-    records,
-    searchStrings,
     allKeys,
     errors,
     state,
     bytesRead,
     totalBytes,
     recordsParsed,
+    dbRecordCount,
     progress,
     fileName,
     limitReached,
