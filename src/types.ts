@@ -25,7 +25,8 @@ export interface ParseError {
 
 /** Messages sent TO the parser worker */
 export type ParserWorkerInMessage =
-  | { type: 'start'; file: File; batchSize: number }
+  | { type: 'start'; file: File; batchSize: number; maxRecords: number }
+  | { type: 'start-url'; url: string; batchSize: number; maxRecords: number }
   | { type: 'cancel' }
 
 /** Messages sent FROM the parser worker */
@@ -35,6 +36,7 @@ export type ParserWorkerOutMessage =
   | { type: 'error'; error: ParseError }
   | { type: 'done'; totalRecords: number; totalErrors: number }
   | { type: 'cancelled' }
+  | { type: 'limit-reached'; totalRecords: number }
 
 /** Messages sent TO the search worker */
 export type SearchWorkerInMessage =

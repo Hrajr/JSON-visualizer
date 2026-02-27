@@ -1,23 +1,238 @@
 /**
  * Parser Web Worker
  *
- * Receives a File object, reads it in chunks using streaming,
- * parses concatenated JSON objects, and sends batches back to main thread.
+ * Reads data from a File object OR a URL (fetch streaming).
+ * Parses concatenated JSON objects and sends batches back to main thread.
+ * Supports a maxRecords limit to prevent memory exhaustion on huge files.
  *
- * Messages IN:  { type: 'start', file: File, batchSize: number }
- *               { type: 'cancel' }
+ * Messages IN:
+ *   { type: 'start', file: File, batchSize: number, maxRecords: number }
+ *   { type: 'start-url', url: string, batchSize: number, maxRecords: number }
+ *   { type: 'cancel' }
  *
- * Messages OUT: { type: 'progress', bytesRead, totalBytes, recordsParsed }
- *               { type: 'batch', records, keys, searchStrings, startIndex }
- *               { type: 'error', error: ParseError }
- *               { type: 'done', totalRecords, totalErrors }
- *               { type: 'cancelled' }
+ * Messages OUT:
+ *   { type: 'progress', bytesRead, totalBytes, recordsParsed }
+ *   { type: 'batch', records, keys, searchStrings, startIndex }
+ *   { type: 'error', error: ParseError }
+ *   { type: 'done', totalRecords, totalErrors }
+ *   { type: 'limit-reached', totalRecords }
+ *   { type: 'cancelled' }
  */
 
 import { extractJsonObjects, buildSearchString } from '../utils/parser'
 import type { JsonRecord, ParseError } from '../types'
 
 let cancelled = false
+
+interface ParseContext {
+  batchSize: number
+  maxRecords: number
+  totalBytes: number
+  bytesRead: number
+  recordsParsed: number
+  totalErrors: number
+  remainder: string
+  batchRecords: JsonRecord[]
+  batchKeys: Set<string>
+  batchSearchStrings: string[]
+  batchStartIndex: number
+}
+
+function createContext(batchSize: number, maxRecords: number, totalBytes: number): ParseContext {
+  return {
+    batchSize,
+    maxRecords,
+    totalBytes,
+    bytesRead: 0,
+    recordsParsed: 0,
+    totalErrors: 0,
+    remainder: '',
+    batchRecords: [],
+    batchKeys: new Set(),
+    batchSearchStrings: [],
+    batchStartIndex: 0,
+  }
+}
+
+function flushBatch(ctx: ParseContext) {
+  if (ctx.batchRecords.length === 0) return
+  self.postMessage({
+    type: 'batch',
+    records: ctx.batchRecords,
+    keys: Array.from(ctx.batchKeys),
+    searchStrings: ctx.batchSearchStrings,
+    startIndex: ctx.batchStartIndex,
+  })
+  ctx.batchStartIndex = ctx.recordsParsed
+  ctx.batchRecords = []
+  ctx.batchKeys = new Set()
+  ctx.batchSearchStrings = []
+}
+
+/** Process a chunk of text data. Returns true if limit reached. */
+function processChunk(ctx: ParseContext, chunk: string, chunkByteLength: number): boolean {
+  ctx.bytesRead += chunkByteLength
+  const text = ctx.remainder + chunk
+  const result = extractJsonObjects(text)
+  ctx.remainder = result.remainder
+
+  for (const jsonStr of result.jsonStrings) {
+    // Check record limit
+    if (ctx.maxRecords > 0 && ctx.recordsParsed >= ctx.maxRecords) {
+      flushBatch(ctx)
+      self.postMessage({ type: 'limit-reached', totalRecords: ctx.recordsParsed })
+      return true
+    }
+
+    try {
+      const record = JSON.parse(jsonStr) as JsonRecord
+      ctx.batchRecords.push(record)
+      for (const key of Object.keys(record)) {
+        ctx.batchKeys.add(key)
+      }
+      ctx.batchSearchStrings.push(buildSearchString(record))
+      ctx.recordsParsed++
+
+      if (ctx.batchRecords.length >= ctx.batchSize) {
+        flushBatch(ctx)
+      }
+    } catch (parseErr) {
+      ctx.totalErrors++
+      const error: ParseError = {
+        recordIndex: ctx.recordsParsed,
+        snippet: jsonStr.substring(0, 200),
+        message: parseErr instanceof Error ? parseErr.message : String(parseErr),
+      }
+      self.postMessage({ type: 'error', error })
+    }
+  }
+
+  // Send progress
+  self.postMessage({
+    type: 'progress',
+    bytesRead: ctx.bytesRead,
+    totalBytes: ctx.totalBytes,
+    recordsParsed: ctx.recordsParsed,
+  })
+
+  return false
+}
+
+function finalize(ctx: ParseContext) {
+  // Handle any remaining text
+  if (ctx.remainder.trim().length > 0) {
+    if (ctx.maxRecords <= 0 || ctx.recordsParsed < ctx.maxRecords) {
+      try {
+        const record = JSON.parse(ctx.remainder) as JsonRecord
+        ctx.batchRecords.push(record)
+        for (const key of Object.keys(record)) {
+          ctx.batchKeys.add(key)
+        }
+        ctx.batchSearchStrings.push(buildSearchString(record))
+        ctx.recordsParsed++
+      } catch {
+        ctx.totalErrors++
+        const error: ParseError = {
+          recordIndex: ctx.recordsParsed,
+          snippet: ctx.remainder.substring(0, 200),
+          message: 'Incomplete or malformed JSON object at end of file',
+        }
+        self.postMessage({ type: 'error', error })
+      }
+    }
+  }
+
+  flushBatch(ctx)
+
+  self.postMessage({
+    type: 'done',
+    totalRecords: ctx.recordsParsed,
+    totalErrors: ctx.totalErrors,
+  })
+}
+
+async function parseFromFile(file: File, batchSize: number, maxRecords: number) {
+  const ctx = createContext(batchSize, maxRecords, file.size)
+
+  if (typeof file.stream === 'function') {
+    const stream = file.stream()
+    const reader = stream.getReader()
+    const decoder = new TextDecoder('utf-8')
+
+    try {
+      while (true) {
+        if (cancelled) { reader.cancel(); self.postMessage({ type: 'cancelled' }); return }
+        const { done, value } = await reader.read()
+        if (done) break
+        const chunk = decoder.decode(value, { stream: true })
+        if (processChunk(ctx, chunk, value.byteLength)) return
+      }
+    } catch (err) {
+      self.postMessage({ type: 'error', error: {
+        recordIndex: -1, snippet: '',
+        message: err instanceof Error ? err.message : String(err),
+      }})
+      return
+    }
+  } else {
+    // Fallback slice-based reading
+    const CHUNK_SIZE = 2 * 1024 * 1024
+    let offset = 0
+    while (offset < file.size) {
+      if (cancelled) { self.postMessage({ type: 'cancelled' }); return }
+      const end = Math.min(offset + CHUNK_SIZE, file.size)
+      const blob = file.slice(offset, end)
+      const text = await blob.text()
+      if (processChunk(ctx, text, end - offset)) return
+      offset = end
+    }
+  }
+
+  finalize(ctx)
+}
+
+async function parseFromUrl(url: string, batchSize: number, maxRecords: number) {
+  try {
+    const response = await fetch(url)
+    if (!response.ok) {
+      self.postMessage({ type: 'error', error: {
+        recordIndex: -1, snippet: '',
+        message: `Failed to fetch: ${response.status} ${response.statusText}. Make sure the file exists in the public/data/ folder.`,
+      }})
+      return
+    }
+
+    const contentLength = response.headers.get('content-length')
+    const totalBytes = contentLength ? parseInt(contentLength, 10) : 0
+    const ctx = createContext(batchSize, maxRecords, totalBytes)
+
+    if (!response.body) {
+      // No streaming – fallback to reading all text (may fail on huge files)
+      const text = await response.text()
+      processChunk(ctx, text, new TextEncoder().encode(text).length)
+      finalize(ctx)
+      return
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+
+    while (true) {
+      if (cancelled) { reader.cancel(); self.postMessage({ type: 'cancelled' }); return }
+      const { done, value } = await reader.read()
+      if (done) break
+      const chunk = decoder.decode(value, { stream: true })
+      if (processChunk(ctx, chunk, value.byteLength)) { reader.cancel(); return }
+    }
+
+    finalize(ctx)
+  } catch (err) {
+    self.postMessage({ type: 'error', error: {
+      recordIndex: -1, snippet: '',
+      message: err instanceof Error ? err.message : String(err),
+    }})
+  }
+}
 
 self.onmessage = async (e: MessageEvent) => {
   const msg = e.data
@@ -29,184 +244,11 @@ self.onmessage = async (e: MessageEvent) => {
 
   if (msg.type === 'start') {
     cancelled = false
-    const file: File = msg.file
-    const batchSize: number = msg.batchSize || 200
-    const totalBytes = file.size
+    await parseFromFile(msg.file, msg.batchSize || 200, msg.maxRecords || 0)
+  }
 
-    let bytesRead = 0
-    let recordsParsed = 0
-    let totalErrors = 0
-    let remainder = ''
-
-    // Accumulate a batch before sending
-    let batchRecords: JsonRecord[] = []
-    let batchKeys: Set<string> = new Set()
-    let batchSearchStrings: string[] = []
-    let batchStartIndex = 0
-
-    const CHUNK_SIZE = 2 * 1024 * 1024 // 2 MB chunks
-
-    function flushBatch() {
-      if (batchRecords.length === 0) return
-      self.postMessage({
-        type: 'batch',
-        records: batchRecords,
-        keys: Array.from(batchKeys),
-        searchStrings: batchSearchStrings,
-        startIndex: batchStartIndex,
-      })
-      batchStartIndex = recordsParsed
-      batchRecords = []
-      batchKeys = new Set()
-      batchSearchStrings = []
-    }
-
-    try {
-      // Use File.stream() for modern browsers, fallback to slice-based reading
-      if (typeof file.stream === 'function') {
-        const stream = file.stream()
-        const reader = stream.getReader()
-        const decoder = new TextDecoder('utf-8')
-
-        while (true) {
-          if (cancelled) {
-            reader.cancel()
-            self.postMessage({ type: 'cancelled' })
-            return
-          }
-
-          const { done, value } = await reader.read()
-          if (done) break
-
-          bytesRead += value.byteLength
-          const chunk = decoder.decode(value, { stream: true })
-          const text = remainder + chunk
-
-          const result = extractJsonObjects(text)
-          remainder = result.remainder
-
-          for (const jsonStr of result.jsonStrings) {
-            try {
-              const record = JSON.parse(jsonStr) as JsonRecord
-              batchRecords.push(record)
-              for (const key of Object.keys(record)) {
-                batchKeys.add(key)
-              }
-              batchSearchStrings.push(buildSearchString(record))
-              recordsParsed++
-
-              if (batchRecords.length >= batchSize) {
-                flushBatch()
-              }
-            } catch (parseErr) {
-              totalErrors++
-              const error: ParseError = {
-                recordIndex: recordsParsed,
-                snippet: jsonStr.substring(0, 200),
-                message: parseErr instanceof Error ? parseErr.message : String(parseErr),
-              }
-              self.postMessage({ type: 'error', error })
-            }
-          }
-
-          // Send progress
-          self.postMessage({
-            type: 'progress',
-            bytesRead,
-            totalBytes,
-            recordsParsed,
-          })
-        }
-      } else {
-        // Fallback: slice-based reading for older browsers
-        let offset = 0
-        while (offset < totalBytes) {
-          if (cancelled) {
-            self.postMessage({ type: 'cancelled' })
-            return
-          }
-
-          const end = Math.min(offset + CHUNK_SIZE, totalBytes)
-          const blob = file.slice(offset, end)
-          const text = remainder + (await blob.text())
-          offset = end
-          bytesRead = end
-
-          const result = extractJsonObjects(text)
-          remainder = result.remainder
-
-          for (const jsonStr of result.jsonStrings) {
-            try {
-              const record = JSON.parse(jsonStr) as JsonRecord
-              batchRecords.push(record)
-              for (const key of Object.keys(record)) {
-                batchKeys.add(key)
-              }
-              batchSearchStrings.push(buildSearchString(record))
-              recordsParsed++
-
-              if (batchRecords.length >= batchSize) {
-                flushBatch()
-              }
-            } catch (parseErr) {
-              totalErrors++
-              const error: ParseError = {
-                recordIndex: recordsParsed,
-                snippet: jsonStr.substring(0, 200),
-                message: parseErr instanceof Error ? parseErr.message : String(parseErr),
-              }
-              self.postMessage({ type: 'error', error })
-            }
-          }
-
-          self.postMessage({
-            type: 'progress',
-            bytesRead,
-            totalBytes,
-            recordsParsed,
-          })
-        }
-      }
-
-      // Handle any remaining text (incomplete final object)
-      if (remainder.trim().length > 0) {
-        // Try to parse remainder as a final object
-        try {
-          const record = JSON.parse(remainder) as JsonRecord
-          batchRecords.push(record)
-          for (const key of Object.keys(record)) {
-            batchKeys.add(key)
-          }
-          batchSearchStrings.push(buildSearchString(record))
-          recordsParsed++
-        } catch {
-          totalErrors++
-          const error: ParseError = {
-            recordIndex: recordsParsed,
-            snippet: remainder.substring(0, 200),
-            message: 'Incomplete or malformed JSON object at end of file',
-          }
-          self.postMessage({ type: 'error', error })
-        }
-      }
-
-      // Flush any remaining batch
-      flushBatch()
-
-      self.postMessage({
-        type: 'done',
-        totalRecords: recordsParsed,
-        totalErrors,
-      })
-    } catch (err) {
-      self.postMessage({
-        type: 'error',
-        error: {
-          recordIndex: -1,
-          snippet: '',
-          message: err instanceof Error ? err.message : String(err),
-        },
-      })
-    }
+  if (msg.type === 'start-url') {
+    cancelled = false
+    await parseFromUrl(msg.url, msg.batchSize || 200, msg.maxRecords || 0)
   }
 }

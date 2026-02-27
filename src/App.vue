@@ -1,14 +1,10 @@
 <script setup lang="ts">
 /**
- * App.vue – Root component wiring together all features:
- *  - FileLoader (top area / empty state)
- *  - SearchBar (top toolbar)
- *  - ColumnManager (left sidebar)
- *  - VirtualTable (main area)
- *  - RowDrawer (right drawer)
- *  - Keyboard shortcuts
+ * App.vue – Root component.
+ * Wires FileLoader, SearchBar, ColumnManager, VirtualTable, RowDrawer.
+ * Includes dark/light mode toggle and keyboard shortcuts.
  */
-import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import FileLoader from './components/FileLoader.vue'
 import SearchBar from './components/SearchBar.vue'
 import ColumnManager from './components/ColumnManager.vue'
@@ -18,44 +14,31 @@ import RowDrawer from './components/RowDrawer.vue'
 import { useParser } from './composables/useParser'
 import { useSearch } from './composables/useSearch'
 import { useColumns } from './composables/useColumns'
+import { useTheme } from './composables/useTheme'
+
+// ── Theme ──
+const { isDark, toggle: toggleTheme } = useTheme()
 
 // ── Parser ──
 const {
-  records,
-  searchStrings,
-  allKeys,
-  errors,
-  state,
-  bytesRead,
-  totalBytes,
-  recordsParsed,
-  progress,
-  fileName,
-  startParsing,
-  cancelParsing,
-  reset: resetParser,
+  records, searchStrings, allKeys, errors, state,
+  bytesRead, totalBytes, recordsParsed, progress, fileName,
+  limitReached, maxRecords,
+  startParsing, startParsingUrl, cancelParsing, reset: resetParser,
 } = useParser()
 
 // ── Columns ──
 const {
-  columns,
-  visibleColumns,
-  toggleVisibility,
-  togglePin,
-  moveColumn,
-  showAll: showAllColumns,
-  hideAll: hideAllColumns,
+  columns, visibleColumns,
+  toggleVisibility, togglePin, moveColumn,
+  showAll: showAllColumns, hideAll: hideAllColumns,
   reset: resetColumns,
 } = useColumns(allKeys)
 
 // ── Search ──
 const totalRecordCount = computed(() => records.value.length)
 const {
-  query: searchQuery,
-  matchingIndices,
-  matchCount,
-  searchTime,
-  isSearching,
+  query: searchQuery, matchingIndices, matchCount, searchTime, isSearching,
   dispose: disposeSearch,
 } = useSearch(searchStrings, totalRecordCount)
 
@@ -67,6 +50,8 @@ const selectedRecord = computed(() => {
   if (selectedRowIndex.value < 0 || selectedRowIndex.value >= records.value.length) return null
   return records.value[selectedRowIndex.value]
 })
+
+const allKeysList = computed(() => Array.from(allKeys.value.keys()))
 
 function onSelectRow(index: number) {
   selectedRowIndex.value = index
@@ -90,6 +75,14 @@ function onLoadFile(file: File) {
   startParsing(file)
 }
 
+function onLoadUrl(url: string, name: string) {
+  resetColumns()
+  searchQuery.value = ''
+  selectedRowIndex.value = -1
+  drawerOpen.value = false
+  startParsingUrl(url, name)
+}
+
 function onCancel() {
   cancelParsing()
 }
@@ -102,43 +95,41 @@ function onReset() {
   drawerOpen.value = false
 }
 
+function onUpdateMaxRecords(val: number) {
+  maxRecords.value = val
+}
+
 // ── Keyboard shortcuts ──
 function onKeydown(e: KeyboardEvent) {
-  // Ctrl/Cmd + F → focus search
   if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
     e.preventDefault()
     const input = document.querySelector('input[placeholder*="Search"]') as HTMLInputElement | null
     input?.focus()
   }
-  // Esc → close drawer
-  if (e.key === 'Escape') {
-    if (drawerOpen.value) {
-      closeDrawer()
-    }
+  if (e.key === 'Escape' && drawerOpen.value) {
+    closeDrawer()
   }
 }
 
-onMounted(() => {
-  window.addEventListener('keydown', onKeydown)
-})
+onMounted(() => window.addEventListener('keydown', onKeydown))
+onBeforeUnmount(() => { window.removeEventListener('keydown', onKeydown); disposeSearch() })
 
-onBeforeUnmount(() => {
-  window.removeEventListener('keydown', onKeydown)
-  disposeSearch()
-})
-
-const isDataReady = computed(() => state.value === 'loaded' || (state.value === 'loading' && records.value.length > 0))
+const isDataReady = computed(() =>
+  state.value === 'loaded' || (state.value === 'loading' && records.value.length > 0)
+)
 </script>
 
 <template>
-  <div class="h-screen flex flex-col bg-gray-50 overflow-hidden">
+  <div class="h-screen flex flex-col bg-gray-50 dark:bg-gray-950 overflow-hidden transition-colors">
     <!-- Top bar -->
-    <header class="shrink-0 border-b bg-white shadow-sm">
-      <!-- Title + controls -->
+    <header class="shrink-0 border-b border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 shadow-sm">
       <div class="flex items-center gap-4 px-4 py-2">
-        <h1 class="text-base font-bold text-gray-800 whitespace-nowrap">JSON Visualizer</h1>
+        <!-- Title -->
+        <h1 class="text-base font-bold text-gray-800 dark:text-gray-100 whitespace-nowrap tracking-tight">
+          JSON Visualizer
+        </h1>
 
-        <!-- Show search when data is available -->
+        <!-- Search (when data available) -->
         <template v-if="isDataReady">
           <SearchBar
             v-model="searchQuery"
@@ -147,21 +138,40 @@ const isDataReady = computed(() => state.value === 'loaded' || (state.value === 
             :search-time="searchTime"
             :is-searching="isSearching"
           />
+        </template>
 
+        <div class="ml-auto flex items-center gap-1">
+          <!-- Dark mode toggle -->
           <button
-            class="ml-auto p-1.5 rounded hover:bg-gray-100 transition-colors text-gray-500"
+            class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors text-gray-500 dark:text-gray-400"
+            :title="isDark ? 'Switch to light mode' : 'Switch to dark mode'"
+            @click="toggleTheme"
+          >
+            <!-- Sun icon (shown in dark mode) -->
+            <svg v-if="isDark" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+            </svg>
+            <!-- Moon icon (shown in light mode) -->
+            <svg v-else class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" />
+            </svg>
+          </button>
+
+          <!-- Column panel toggle -->
+          <button
+            v-if="isDataReady"
+            class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors text-gray-500 dark:text-gray-400"
             :title="sidebarOpen ? 'Hide column panel' : 'Show column panel'"
             @click="sidebarOpen = !sidebarOpen"
           >
-            <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                d="M3 4h18M3 8h18M3 12h18M3 16h18M3 20h18" />
+            <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M9 4h6M9 8h6M9 12h6M9 16h6M9 20h6" />
             </svg>
           </button>
-        </template>
+        </div>
       </div>
 
-      <!-- File info bar (when loaded or loading) -->
+      <!-- File progress / info bar -->
       <template v-if="state !== 'idle'">
         <FileLoader
           :state="state"
@@ -171,16 +181,20 @@ const isDataReady = computed(() => state.value === 'loaded' || (state.value === 
           :records-parsed="recordsParsed"
           :file-name="fileName"
           :error-count="errors.length"
+          :limit-reached="limitReached"
+          :max-records="maxRecords"
           @load="onLoadFile"
+          @load-url="onLoadUrl"
           @cancel="onCancel"
           @reset="onReset"
+          @update:max-records="onUpdateMaxRecords"
         />
       </template>
     </header>
 
     <!-- Main content -->
     <div class="flex-1 flex min-h-0">
-      <!-- Empty state: file loader -->
+      <!-- Empty state -->
       <template v-if="state === 'idle'">
         <div class="flex-1 flex items-center justify-center">
           <FileLoader
@@ -191,20 +205,24 @@ const isDataReady = computed(() => state.value === 'loaded' || (state.value === 
             :records-parsed="0"
             file-name=""
             :error-count="0"
+            :limit-reached="false"
+            :max-records="maxRecords"
             @load="onLoadFile"
+            @load-url="onLoadUrl"
             @cancel="onCancel"
             @reset="onReset"
+            @update:max-records="onUpdateMaxRecords"
           />
         </div>
       </template>
 
       <!-- Data view -->
       <template v-else>
-        <!-- Left sidebar: Column manager -->
+        <!-- Left sidebar -->
         <Transition name="sidebar">
           <aside
             v-if="sidebarOpen && isDataReady"
-            class="w-56 shrink-0 border-r bg-white overflow-hidden"
+            class="w-56 shrink-0 border-r border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 overflow-hidden"
           >
             <ColumnManager
               :columns="columns"
@@ -229,8 +247,7 @@ const isDataReady = computed(() => state.value === 'loaded' || (state.value === 
             :filtered-indices="matchingIndices"
             @select-row="onSelectRow"
           />
-          <!-- Loading placeholder when no records yet -->
-          <div v-else-if="state === 'loading'" class="flex-1 flex items-center justify-center text-gray-400">
+          <div v-else-if="state === 'loading'" class="flex-1 flex items-center justify-center text-gray-400 dark:text-gray-600">
             <div class="flex items-center gap-2">
               <svg class="w-5 h-5 animate-spin" viewBox="0 0 24 24" fill="none">
                 <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
@@ -248,6 +265,7 @@ const isDataReady = computed(() => state.value === 'loaded' || (state.value === 
       :record="selectedRecord"
       :record-index="selectedRowIndex"
       :open="drawerOpen"
+      :all-keys="allKeysList"
       @close="closeDrawer"
     />
 
@@ -255,17 +273,17 @@ const isDataReady = computed(() => state.value === 'loaded' || (state.value === 
     <Transition name="fade">
       <div
         v-if="errors.length > 0 && state === 'loaded'"
-        class="fixed bottom-4 right-4 bg-amber-50 border border-amber-200 rounded-lg shadow-lg p-3 max-w-sm z-50"
+        class="fixed bottom-4 right-4 bg-amber-50 dark:bg-amber-950/80 border border-amber-200 dark:border-amber-800 rounded-xl shadow-lg p-4 max-w-sm z-30"
       >
         <div class="flex items-start gap-2">
           <svg class="w-5 h-5 text-amber-500 shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
             <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>
           </svg>
           <div>
-            <p class="text-sm font-medium text-amber-800">
+            <p class="text-sm font-medium text-amber-800 dark:text-amber-200">
               {{ errors.length }} parse error{{ errors.length > 1 ? 's' : '' }}
             </p>
-            <p class="text-xs text-amber-600 mt-0.5">
+            <p class="text-xs text-amber-600 dark:text-amber-400 mt-0.5">
               {{ errors[0]?.message }}
             </p>
           </div>
