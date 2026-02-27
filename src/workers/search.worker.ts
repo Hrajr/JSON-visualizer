@@ -13,7 +13,7 @@ import type { DatasetRange } from '../types'
 const DB_VERSION = 1
 const RECORDS_STORE = 'records'
 const META_STORE = 'meta'
-const SCAN_CHUNK = 50_000
+const SCAN_CHUNK = 10_000
 
 let currentOpId = 0
 const dbCache = new Map<string, IDBDatabase>()
@@ -36,23 +36,26 @@ function openDB(name: string): Promise<IDBDatabase> {
 // ── Search ──
 
 function buildSearchString(record: Record<string, unknown>): string {
-  const parts: string[] = []
+  let s = ''
   for (const val of Object.values(record)) {
-    if (val !== null && val !== undefined) parts.push(String(val))
+    if (val !== null && val !== undefined) {
+      if (s) s += ' '
+      s += typeof val === 'string' ? val : String(val)
+    }
   }
-  return parts.join(' ').toLowerCase()
+  return s.toLowerCase()
 }
 
 async function searchDataset(
   dbName: string,
   offset: number,
   terms: string[],
-  propFilter: string,
+  propFilters: string[],
   opId: number,
 ): Promise<number[]> {
   const db = await openDB(dbName)
   const hasQuery = terms.length > 0
-  const hasProp = propFilter.length > 0
+  const hasProp = propFilters.length > 0
   const matches: number[] = []
   let nextKey: IDBValidKey = 0
 
@@ -90,8 +93,10 @@ async function searchDataset(
       }
 
       if (match && hasProp) {
-        const val = record[propFilter]
-        if (val === null || val === undefined || val === '') match = false
+        for (const pf of propFilters) {
+          const val = record[pf]
+          if (val === null || val === undefined || val === '') { match = false; break }
+        }
       }
 
       if (match) matches.push((keys[i] as number) + offset)
@@ -105,12 +110,12 @@ async function searchDataset(
   return matches
 }
 
-async function search(query: string, propertyFilter: string, datasets: DatasetRange[], opId: number) {
+async function search(query: string, propertyFilters: string[], datasets: DatasetRange[], opId: number) {
   const start = performance.now()
 
   const lowerQuery = query.toLowerCase().trim()
   const terms = lowerQuery ? lowerQuery.split(/\s+/).filter(Boolean) : []
-  const hasProp = propertyFilter.length > 0
+  const hasProp = propertyFilters.length > 0
 
   if (terms.length === 0 && !hasProp) {
     if (opId === currentOpId) {
@@ -123,7 +128,7 @@ async function search(query: string, propertyFilter: string, datasets: DatasetRa
 
   for (const ds of datasets) {
     if (opId !== currentOpId) return
-    const dsMatches = await searchDataset(ds.dbName, ds.offset, terms, propertyFilter, opId)
+    const dsMatches = await searchDataset(ds.dbName, ds.offset, terms, propertyFilters, opId)
     if (opId !== currentOpId) return
     allMatches.push(...dsMatches)
   }
@@ -236,9 +241,22 @@ self.onmessage = (e: MessageEvent) => {
     return
   }
 
+  if (msg.type === 'close-all-dbs') {
+    currentOpId++
+    for (const [, db] of dbCache) {
+      try { db.close() } catch { /* ignore */ }
+    }
+    dbCache.clear()
+    self.postMessage({ type: 'dbs-closed' })
+    return
+  }
+
   if (msg.type === 'search') {
     const opId = ++currentOpId
-    search(msg.query, msg.propertyFilter, msg.datasets || [], opId)
+    // Support both legacy string and new array format
+    const pf = Array.isArray(msg.propertyFilters) ? msg.propertyFilters
+      : (msg.propertyFilter ? [msg.propertyFilter] : [])
+    search(msg.query, pf, msg.datasets || [], opId)
   }
 
   if (msg.type === 'sort') {

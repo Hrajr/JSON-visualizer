@@ -57,6 +57,28 @@ function closeWorkerDB(): void {
   if (db) { db.close(); db = null; currentDBName = '' }
 }
 
+/** Delete ALL jv-ds-* databases except `keepName` to free IDB quota. */
+async function deleteOldJvDatabases(keepName: string): Promise<void> {
+  if (typeof indexedDB.databases !== 'function') return
+  try {
+    const allDBs = await indexedDB.databases()
+    for (const info of allDBs) {
+      if (info.name && info.name.startsWith('jv-ds-') && info.name !== keepName) {
+        await new Promise<void>(resolve => {
+          const req = indexedDB.deleteDatabase(info.name!)
+          req.onsuccess = () => resolve()
+          req.onerror = () => resolve()
+          req.onblocked = () => {
+            // Force-resolve after timeout; blocker is gone by now ideally
+            const t = setTimeout(resolve, 3000)
+            req.onsuccess = () => { clearTimeout(t); resolve() }
+          }
+        })
+      }
+    }
+  } catch { /* best effort */ }
+}
+
 function clearDB(dbName: string): Promise<void> {
   return openWorkerDB(dbName).then(d => new Promise((resolve, reject) => {
     const tx = d.transaction([RECORDS_STORE, META_STORE], 'readwrite')
@@ -67,7 +89,7 @@ function clearDB(dbName: string): Promise<void> {
   }))
 }
 
-function writeBatch(
+function writeBatchDirect(
   startIndex: number,
   records: JsonRecord[],
 ): Promise<void> {
@@ -82,6 +104,39 @@ function writeBatch(
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
   })
+}
+
+/** Write batch with automatic retry using progressively smaller sub-batches on quota errors. */
+async function writeBatch(
+  startIndex: number,
+  records: JsonRecord[],
+): Promise<void> {
+  try {
+    await writeBatchDirect(startIndex, records)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    const isQuota = msg.toLowerCase().includes('quota')
+    if (isQuota && records.length > 1) {
+      // Progressively halve the batch size until we're writing single records
+      const half = Math.max(1, Math.floor(records.length / 2))
+      for (let i = 0; i < records.length; i += half) {
+        const slice = records.slice(i, Math.min(i + half, records.length))
+        await writeBatch(startIndex + i, slice) // recursive – will keep halving on failure
+      }
+    } else if (isQuota && records.length === 1) {
+      // Even a single record exceeds quota – report non-fatal error and skip
+      self.postMessage({
+        type: 'error',
+        error: {
+          recordIndex: startIndex,
+          snippet: JSON.stringify(records[0]).substring(0, 200),
+          message: 'IDB quota exceeded – record skipped',
+        },
+      })
+    } else {
+      throw err
+    }
+  }
 }
 
 // ── JSON repair ──
@@ -146,7 +201,7 @@ interface ParseContext {
   batchStartIndex: number
 }
 
-const IDB_FLUSH_SIZE = 500
+const IDB_FLUSH_SIZE = 50
 
 function createContext(dbName: string, maxRecords: number, totalBytes: number): ParseContext {
   return {
@@ -271,6 +326,8 @@ async function finalize(ctx: ParseContext) {
 
 async function parseFromFile(file: File, maxRecords: number, dbName: string) {
   try {
+    // Delete any leftover databases from previous sessions to free IDB quota
+    await deleteOldJvDatabases(dbName)
     await clearDB(dbName)
     const ctx = createContext(dbName, maxRecords, file.size)
 
@@ -316,6 +373,8 @@ async function parseFromFile(file: File, maxRecords: number, dbName: string) {
 
 async function parseFromUrl(url: string, maxRecords: number, dbName: string) {
   try {
+    // Delete any leftover databases from previous sessions to free IDB quota
+    await deleteOldJvDatabases(dbName)
     await clearDB(dbName)
     const response = await fetch(url)
     if (!response.ok) {

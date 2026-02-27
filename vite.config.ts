@@ -37,8 +37,8 @@ function dataFolderPlugin(): Plugin {
       })
     },
 
-    writeBundle(options) {
-      const outDir = options.dir || 'dist'
+    writeBundle(_options, _bundle) {
+      const outDir = 'dist'
       const absDir = path.resolve(DATA_DIR)
       const files = scanTxtFiles(absDir)
       const destDir = path.resolve(outDir, 'data')

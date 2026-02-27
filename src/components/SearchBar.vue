@@ -17,9 +17,9 @@ function onClear() {
 </script>
 
 <template>
-  <div class="flex items-center gap-3">
+  <div class="flex items-center gap-3 w-full max-w-xl">
     <!-- Search input -->
-    <div class="relative group">
+    <div class="relative group flex-1">
       <svg
         class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 dark:text-gray-500 group-focus-within:text-blue-500 transition-colors"
         fill="none" viewBox="0 0 24 24" stroke="currentColor"
@@ -32,15 +32,16 @@ function onClear() {
         v-model="query"
         type="text"
         placeholder="Search records... (Ctrl+F)"
-        class="pl-9 pr-9 py-2 text-sm border border-gray-200 dark:border-gray-600 rounded-xl w-80
-               bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200
+        class="w-full pl-9 pr-9 py-1.5 text-sm border border-gray-200 dark:border-gray-700/80 rounded-lg
+               bg-gray-50 dark:bg-gray-800/50 text-gray-800 dark:text-gray-200
                placeholder-gray-400 dark:placeholder-gray-500
-               focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-transparent
-               shadow-sm transition-all"
+               focus:outline-none focus:ring-2 focus:ring-blue-400/50 focus:border-blue-400
+               focus:bg-white dark:focus:bg-gray-800
+               transition-all"
       />
       <button
         v-if="query"
-        class="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 rounded-full text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+        class="absolute right-2.5 top-1/2 -translate-y-1/2 p-0.5 rounded-full text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
         @click="onClear"
       >
         <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
@@ -50,22 +51,22 @@ function onClear() {
     </div>
 
     <!-- Stats -->
-    <div class="text-xs whitespace-nowrap min-w-[100px]">
+    <div class="text-xs whitespace-nowrap min-w-[80px] tabular-nums">
       <template v-if="isSearching">
         <span class="inline-flex items-center gap-1.5 text-blue-500 dark:text-blue-400">
           <svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none">
             <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
             <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
           </svg>
-          Searching...
+          <span class="text-xs">Searching</span>
         </span>
       </template>
       <template v-else-if="query">
-        <span class="text-gray-600 dark:text-gray-400 font-medium">
+        <span class="text-gray-600 dark:text-gray-300 font-medium">
           {{ matchCount.toLocaleString() }}
         </span>
         <span class="text-gray-400 dark:text-gray-500"> / {{ totalCount.toLocaleString() }}</span>
-        <span v-if="searchTime > 0" class="text-gray-400 dark:text-gray-600 ml-1">({{ searchTime }}ms)</span>
+        <span v-if="searchTime > 0" class="text-gray-400 dark:text-gray-600 ml-1 text-[10px]">({{ searchTime }}ms)</span>
       </template>
     </div>
   </div>

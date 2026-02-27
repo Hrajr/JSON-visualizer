@@ -35,6 +35,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'select-row', index: number): void
   (e: 'sort', column: string): void
+  (e: 'reorder-column', fromKey: string, toKey: string): void
 }>()
 
 const pageSize = ref(100)
@@ -162,6 +163,30 @@ function onHeaderClick(column: string) {
   emit('sort', column)
 }
 
+// ── Column drag reorder ──
+const dragSourceKey = ref('')
+const dragOverKey = ref('')
+
+function onColDragStart(e: DragEvent, key: string) {
+  dragSourceKey.value = key
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.setData('text/plain', key)
+  }
+}
+function onColDragOver(key: string) {
+  if (key !== dragSourceKey.value) dragOverKey.value = key
+}
+function onColDragLeave() { dragOverKey.value = '' }
+function onColDrop(targetKey: string) {
+  dragOverKey.value = ''
+  if (dragSourceKey.value && dragSourceKey.value !== targetKey) {
+    emit('reorder-column', dragSourceKey.value, targetKey)
+  }
+  dragSourceKey.value = ''
+}
+function onColDragEnd() { dragSourceKey.value = ''; dragOverKey.value = '' }
+
 const startRecord = computed(() => (currentPage.value - 1) * pageSize.value + 1)
 const endRecord = computed(() => Math.min(currentPage.value * pageSize.value, totalRows.value))
 </script>
@@ -194,26 +219,35 @@ const endRecord = computed(() => Math.min(currentPage.value * pageSize.value, to
 
     <!-- Table container -->
     <div class="flex-1 overflow-auto virtual-table-scroll">
-      <table class="w-full border-collapse min-w-max">
+      <table class="w-full border-collapse min-w-max text-[13px] leading-relaxed">
         <!-- Sticky header -->
         <thead class="sticky top-0 z-20">
           <tr>
-            <th class="shrink-0 w-16 px-2 py-2.5 text-xs font-semibold text-gray-500 dark:text-gray-400 border-b border-r border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 sticky left-0 z-30 text-left">
+            <th class="shrink-0 w-16 px-3 py-2 text-[10px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider border-b border-r border-gray-200/60 dark:border-gray-700/60 bg-gray-50 dark:bg-gray-800/80 sticky left-0 z-30 text-right">
               #
             </th>
             <th
               v-for="col in columns"
               :key="col.key"
-              class="px-2 py-2.5 text-xs font-semibold text-gray-700 dark:text-gray-300 border-b border-r border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 text-left cell-truncate cursor-pointer select-none hover:bg-gray-200/60 dark:hover:bg-gray-700/60 transition-colors"
-              :class="col.pinned ? 'sticky z-30' : ''"
+              draggable="true"
+              class="px-3 py-2 text-[10px] font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider border-b border-r border-gray-200/60 dark:border-gray-700/60 bg-gray-50 dark:bg-gray-800/80 text-left cell-truncate cursor-pointer select-none hover:bg-gray-100 dark:hover:bg-gray-700/60 transition-colors"
+              :class="[
+                col.pinned ? 'sticky z-30' : '',
+                dragOverKey === col.key ? 'ring-2 ring-blue-400 ring-inset' : '',
+              ]"
               :style="{
                 width: '180px',
                 minWidth: '180px',
                 maxWidth: '180px',
                 ...(col.pinned ? { left: `${64 + columns.filter(c => c.pinned && c.order < col.order).length * 180}px` } : {}),
               }"
-              :title="`Click to sort by ${col.key}`"
+              :title="`Click to sort \u00b7 Drag to reorder`"
               @click="onHeaderClick(col.key)"
+              @dragstart="onColDragStart($event, col.key)"
+              @dragover.prevent="onColDragOver(col.key)"
+              @dragleave="onColDragLeave"
+              @drop.prevent="onColDrop(col.key)"
+              @dragend="onColDragEnd"
             >
               <div class="flex items-center gap-1">
                 <span class="truncate">{{ formatColumnName(col.key) }}</span>
@@ -233,16 +267,16 @@ const endRecord = computed(() => Math.min(currentPage.value * pageSize.value, to
           <tr
             v-for="row in pageRows"
             :key="row.dataIndex"
-            class="border-b border-gray-100 dark:border-gray-800 hover:bg-blue-50 dark:hover:bg-blue-950/40 cursor-pointer transition-colors"
+            class="border-b border-gray-100/80 dark:border-gray-800/60 hover:bg-blue-50/60 dark:hover:bg-blue-950/30 cursor-pointer transition-colors"
             @click="emit('select-row', row.dataIndex)"
           >
-            <td class="shrink-0 w-16 px-2 py-2 text-xs text-gray-400 dark:text-gray-500 border-r border-gray-100 dark:border-gray-800 bg-white dark:bg-gray-900 sticky left-0 z-10">
+            <td class="shrink-0 w-16 px-3 py-1.5 text-[11px] font-mono text-gray-400 dark:text-gray-500 border-r border-gray-100/60 dark:border-gray-800/40 bg-white dark:bg-gray-900 sticky left-0 z-10 text-right tabular-nums">
               {{ row.dataIndex + 1 }}
             </td>
             <td
               v-for="col in columns"
               :key="col.key"
-              class="px-2 py-2 text-xs border-r border-gray-100 dark:border-gray-800 bg-white dark:bg-gray-900"
+              class="px-3 py-1.5 text-[13px] border-r border-gray-100/60 dark:border-gray-800/40 bg-white dark:bg-gray-900"
               :class="col.pinned ? 'sticky z-10' : ''"
               :style="{
                 width: '180px',
@@ -276,7 +310,7 @@ const endRecord = computed(() => Math.min(currentPage.value * pageSize.value, to
     <!-- Pagination footer -->
     <div
       v-if="totalRows > 0"
-      class="shrink-0 flex items-center justify-between gap-4 px-3 py-2 border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-xs transition-[padding] duration-300"
+      class="shrink-0 flex items-center justify-between gap-4 px-4 py-2.5 border-t border-gray-200/80 dark:border-gray-700/80 bg-white dark:bg-gray-900 text-xs transition-[padding] duration-300"
       :class="isLoading ? 'pb-8' : ''"
     >
       <!-- Left: page size & info -->
@@ -287,7 +321,7 @@ const endRecord = computed(() => Math.min(currentPage.value * pageSize.value, to
             id="page-size"
             :value="pageSize"
             @change="onPageSizeChange"
-            class="px-1.5 py-0.5 border border-gray-200 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
+            class="px-2 py-0.5 border border-gray-200 dark:border-gray-600 rounded-md bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 text-xs focus:outline-none focus:ring-1 focus:ring-blue-400 shadow-soft"
           >
             <option v-for="size in PAGE_SIZE_OPTIONS" :key="size" :value="size">{{ size }}</option>
           </select>

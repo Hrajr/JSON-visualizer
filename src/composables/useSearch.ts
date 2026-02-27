@@ -12,11 +12,13 @@ import SearchWorker from '../workers/search.worker?worker'
 
 export function useSearch(totalCount: Ref<number>, datasetRanges: Ref<DatasetRange[]>) {
   const query = ref('')
-  const propertyFilter = ref('')
+  const propertyFilters = ref<string[]>([])
 
   /** null = show all (no active search/filter). */
   const matchingIndices = ref<number[] | null>(null)
-  const matchCount = ref(0)
+  const matchCount = computed(() =>
+    matchingIndices.value !== null ? matchingIndices.value.length : totalCount.value
+  )
   const searchTime = ref(0)
   const isSearching = ref(false)
 
@@ -42,7 +44,6 @@ export function useSearch(totalCount: Ref<number>, datasetRanges: Ref<DatasetRan
         const msg = e.data
         if (msg.type === 'result') {
           matchingIndices.value = msg.matchingIndices
-          matchCount.value = msg.matchingIndices ? msg.matchingIndices.length : totalCount.value
           searchTime.value = Math.round(msg.timeTaken * 100) / 100
           isSearching.value = false
 
@@ -67,11 +68,10 @@ export function useSearch(totalCount: Ref<number>, datasetRanges: Ref<DatasetRan
 
   function runSearch() {
     const q = query.value.trim()
-    const pf = propertyFilter.value
+    const pf = propertyFilters.value
 
-    if (!q && !pf) {
+    if (!q && pf.length === 0) {
       matchingIndices.value = null
-      matchCount.value = totalCount.value
       searchTime.value = 0
       isSearching.value = false
 
@@ -89,7 +89,7 @@ export function useSearch(totalCount: Ref<number>, datasetRanges: Ref<DatasetRan
     w.postMessage({
       type: 'search',
       query: q,
-      propertyFilter: pf,
+      propertyFilters: pf,
       datasets: datasetRanges.value,
     })
   }
@@ -139,44 +139,63 @@ export function useSearch(totalCount: Ref<number>, datasetRanges: Ref<DatasetRan
     isSorting.value = false
   }
 
-  // Debounced watch on query + propertyFilter
-  watch([query, propertyFilter], () => {
+  // Debounced watch on query + propertyFilters
+  watch([query, propertyFilters], () => {
     if (debounceTimer) clearTimeout(debounceTimer)
     debounceTimer = setTimeout(runSearch, 250)
-  })
+  }, { deep: true })
 
-  // Re-run search when dataset ranges change (e.g., dataset switch)
-  watch(datasetRanges, () => {
-    if (query.value.trim() || propertyFilter.value) {
+  // Re-run search when dataset ranges structurally change (dataset switch, not count updates)
+  let lastRangeSignature = ''
+  watch(datasetRanges, (ranges) => {
+    const sig = ranges.map(r => r.id + ':' + r.dbName).join('|')
+    if (sig === lastRangeSignature) return // Just a count update during loading
+    lastRangeSignature = sig
+    if (query.value.trim() || propertyFilters.value.length > 0) {
       if (debounceTimer) clearTimeout(debounceTimer)
       debounceTimer = setTimeout(runSearch, 500)
     } else {
       matchingIndices.value = null
-      matchCount.value = totalCount.value
       if (sortColumn.value) runSort()
       else sortedIndices.value = null
     }
-  })
+  }, { deep: true })
 
-  // Re-run when totalCount changes (during loading)
-  watch(totalCount, () => {
-    if (query.value.trim() || propertyFilter.value) {
-      if (debounceTimer) clearTimeout(debounceTimer)
-      debounceTimer = setTimeout(runSearch, 500)
-    } else {
-      matchingIndices.value = null
-      matchCount.value = totalCount.value
-    }
-  })
+  // No auto-retrigger on totalCount changes (avoids constant re-searching during loading).
+  // matchCount is a computed that automatically reflects totalCount when no search is active.
 
   function dispose() {
     if (worker) { worker.terminate(); worker = null }
     if (debounceTimer) clearTimeout(debounceTimer)
   }
 
+  /**
+   * Tell the search worker to close all its cached IDB connections.
+   * Must be called BEFORE deleting databases so deleteDatabase isn't blocked.
+   */
+  function closeAllWorkerDBs(): Promise<void> {
+    if (!worker) return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      const w = worker!
+      const handler = (e: MessageEvent) => {
+        if (e.data.type === 'dbs-closed') {
+          w.removeEventListener('message', handler)
+          resolve()
+        }
+      }
+      w.addEventListener('message', handler)
+      w.postMessage({ type: 'close-all-dbs' })
+      // Safety timeout – if worker doesn't respond in 2s, continue anyway
+      setTimeout(() => {
+        w.removeEventListener('message', handler)
+        resolve()
+      }, 2000)
+    })
+  }
+
   return {
     query,
-    propertyFilter,
+    propertyFilters,
     matchingIndices,
     matchCount,
     searchTime,
@@ -189,5 +208,6 @@ export function useSearch(totalCount: Ref<number>, datasetRanges: Ref<DatasetRan
     setSort,
     resetSort,
     dispose,
+    closeAllWorkerDBs,
   }
 }

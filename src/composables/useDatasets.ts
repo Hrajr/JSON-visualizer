@@ -11,8 +11,9 @@ import type { DatasetInfo, DatasetRange, JsonRecord } from '../types'
 import {
   getSavedDatasets, saveDatasetInfo, removeDatasetInfo,
   getSavedActiveIds, saveActiveIds,
-  deleteNamedDB, computeRanges,
+  deleteNamedDB, deleteAllJvDatabases, computeRanges,
   getRecordByAbsoluteIndex, getRecordsByAbsoluteIndices,
+  getExistingJvDatabaseNames,
 } from '../utils/db'
 
 export function useDatasets() {
@@ -43,11 +44,28 @@ export function useDatasets() {
     return keyMap
   })
 
-  /** Load state from localStorage. Call once on mount. */
-  function init() {
+  /** Load state from localStorage. Validates IDB databases still exist. */
+  async function init() {
     datasets.value = getSavedDatasets()
     const saved = getSavedActiveIds()
     activeIds.value = saved.filter(id => datasets.value.some(d => d.id === id))
+
+    // Validate that IDB databases actually exist (may have been evicted by browser)
+    try {
+      const existingNames = await getExistingJvDatabaseNames()
+      if (existingNames.size > 0 || datasets.value.length > 0) {
+        const validDatasets = datasets.value.filter(ds => existingNames.has(ds.dbName))
+        if (validDatasets.length !== datasets.value.length) {
+          // Some databases were evicted – clean up metadata
+          datasets.value = validDatasets
+          localStorage.setItem('jv-datasets', JSON.stringify(validDatasets))
+          activeIds.value = activeIds.value.filter(id => validDatasets.some(d => d.id === id))
+          saveActiveIds(activeIds.value)
+        }
+      }
+    } catch {
+      // If databases() API fails, trust localStorage
+    }
   }
 
   /**
@@ -86,6 +104,22 @@ export function useDatasets() {
     saveActiveIds(activeIds.value)
   }
 
+  /** Delete ALL datasets and their IDB databases. Frees storage quota.
+   *  Uses indexedDB.databases() to also delete orphaned databases not tracked in localStorage. */
+  async function clearAllDatasets() {
+    // CRITICAL: Clear reactive state FIRST so the table stops fetching data.
+    // Otherwise Vue watchers re-open IDB connections during deletion, blocking it.
+    const toCleanMeta = [...datasets.value]
+    datasets.value = []
+    activeIds.value = []
+    saveActiveIds([])
+    for (const ds of toCleanMeta) removeDatasetInfo(ds.id)
+
+    // Now that no reactive code is accessing databases, delete them all.
+    // Uses indexedDB.databases() to also catch orphaned databases.
+    await deleteAllJvDatabases()
+  }
+
   /** Delete a dataset (removes IDB + metadata). */
   async function removeDataset(id: string) {
     const ds = datasets.value.find(d => d.id === id)
@@ -118,6 +152,7 @@ export function useDatasets() {
     selectDataset,
     toggleDataset,
     setActiveIds,
+    clearAllDatasets,
     removeDataset,
     getRecord,
     getRecords,

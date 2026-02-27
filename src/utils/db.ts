@@ -98,8 +98,57 @@ export async function deleteNamedDB(name: string): Promise<void> {
     const req = indexedDB.deleteDatabase(name)
     req.onsuccess = () => resolve()
     req.onerror = () => resolve() // best effort
-    req.onblocked = () => resolve()
+    req.onblocked = () => {
+      // DB is blocked by another connection. The delete WILL complete once
+      // the blocker closes – we listen for onsuccess which fires eventually.
+      // Safety timeout so we don't hang forever.
+      const timer = setTimeout(resolve, 5000)
+      req.onsuccess = () => { clearTimeout(timer); resolve() }
+    }
   })
+}
+
+/**
+ * Enumerate ALL IndexedDB databases whose name starts with 'jv-ds-' and delete them.
+ * Uses indexedDB.databases() (Chrome 72+) to find orphaned databases that are
+ * no longer tracked in localStorage.
+ */
+/**
+ * Get a set of all existing IDB database names that start with 'jv-ds-'.
+ * Returns empty set if indexedDB.databases() is not supported.
+ */
+export async function getExistingJvDatabaseNames(): Promise<Set<string>> {
+  if (typeof indexedDB.databases !== 'function') return new Set()
+  try {
+    const allDBs = await indexedDB.databases()
+    return new Set(
+      allDBs
+        .filter(db => db.name && db.name.startsWith('jv-ds-'))
+        .map(db => db.name!)
+    )
+  } catch {
+    return new Set()
+  }
+}
+
+export async function deleteAllJvDatabases(): Promise<void> {
+  // Close all main-thread connections first
+  closeAllDBs()
+
+  // indexedDB.databases() is not available in all browsers
+  if (typeof indexedDB.databases !== 'function') return
+
+  try {
+    const allDBs = await indexedDB.databases()
+    const jvDBs = allDBs.filter(db => db.name && db.name.startsWith('jv-ds-'))
+    for (const db of jvDBs) {
+      if (db.name) {
+        await deleteNamedDB(db.name)
+      }
+    }
+  } catch {
+    // Best effort – fall through if databases() isn't supported or fails
+  }
 }
 
 export async function clearStores(dbName: string): Promise<void> {
@@ -111,6 +160,39 @@ export async function clearStores(dbName: string): Promise<void> {
     tx.oncomplete = () => resolve()
     tx.onerror = () => reject(tx.error)
   })
+}
+
+// ── Storage management (fixes Firefox 2GB IDB limit) ──
+
+/**
+ * Request persistent storage from the browser.
+ * Firefox limits IDB to ~2GB in "best-effort" mode but allows more with persistent storage.
+ * Chrome is more lenient but persistent storage still helps prevent eviction.
+ * Should be called early in app lifecycle (e.g. on mount).
+ */
+export async function requestPersistentStorage(): Promise<boolean> {
+  if (!navigator.storage?.persist) return false
+  try {
+    const alreadyPersisted = await navigator.storage.persisted()
+    if (alreadyPersisted) return true
+    return await navigator.storage.persist()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Estimate available storage. Returns { usage, quota } in bytes,
+ * or null if the StorageManager API is unavailable.
+ */
+export async function estimateStorage(): Promise<{ usage: number; quota: number } | null> {
+  if (!navigator.storage?.estimate) return null
+  try {
+    const est = await navigator.storage.estimate()
+    return { usage: est.usage ?? 0, quota: est.quota ?? 0 }
+  } catch {
+    return null
+  }
 }
 
 // ── Single-DB record access ──
