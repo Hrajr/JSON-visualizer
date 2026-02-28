@@ -380,10 +380,22 @@ export function getRecordsByAbsoluteIndices(
 
 /**
  * Escape a user search term for safe use in an FTS5 MATCH query.
- * Wraps in double-quotes (phrase query) and doubles any internal quotes.
+ * Each word gets a prefix wildcard (*) so partial terms match:
+ * e.g. "tes" matches "test", "tesla", etc.
+ * Multi-word terms use implicit AND: "john mad" matches records
+ * containing words starting with "john" AND "mad".
+ * Special FTS5 characters are stripped to prevent query syntax errors.
  */
 function escapeFtsTerm(term: string): string {
-  return '"' + term.replace(/"/g, '""') + '"'
+  const words = term.trim().split(/\s+/).filter(Boolean)
+  return words
+    .map(w => {
+      // Strip characters that have special meaning in FTS5 queries
+      const clean = w.replace(/["*^():{}<>]/g, '')
+      return clean.length > 0 ? clean + '*' : ''
+    })
+    .filter(Boolean)
+    .join(' ')
 }
 
 /**
@@ -435,10 +447,12 @@ export function searchRecords(
 
       let rows: { idx: number }[]
 
-      if (hasFts && terms.length > 0) {
-        // ── Fast path: FTS5 indexed search ──
-        const ftsQuery = terms.map(escapeFtsTerm).join(' ')
+      const ftsQuery = hasFts && terms.length > 0
+        ? terms.map(escapeFtsTerm).filter(Boolean).join(' ')
+        : ''
 
+      if (ftsQuery) {
+        // ── Fast path: FTS5 indexed search ──
         if (propConditions.length === 0) {
           // Pure FTS search – no join needed
           rows = db.prepare(
@@ -840,9 +854,17 @@ function buildWhereClause(
 
   // Search terms
   if (terms.length > 0 && hasFts) {
-    ftsQuery = terms.map(escapeFtsTerm).join(' ')
-    conditions.push('idx IN (SELECT rowid FROM records_fts WHERE records_fts MATCH ?)')
-    params.push(ftsQuery)
+    ftsQuery = terms.map(escapeFtsTerm).filter(Boolean).join(' ')
+    if (ftsQuery) {
+      conditions.push('idx IN (SELECT rowid FROM records_fts WHERE records_fts MATCH ?)')
+      params.push(ftsQuery)
+    } else {
+      // All terms were special chars only — fall back to LIKE
+      for (const term of terms) {
+        conditions.push('search_text LIKE ?')
+        params.push(`%${term}%`)
+      }
+    }
   } else if (terms.length > 0) {
     for (const term of terms) {
       conditions.push('search_text LIKE ?')
