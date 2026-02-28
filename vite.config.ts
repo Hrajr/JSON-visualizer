@@ -195,10 +195,13 @@ function sqliteApiPlugin(): Plugin {
               page: number
               pageSize: number
             }
+            const isCancelled = () => !!(req.socket?.destroyed)
             const result = db.queryRecords(
               body.datasets, body.query, body.propertyFilters,
               body.sortColumn, body.sortDirection, body.page, body.pageSize,
+              isCancelled,
             )
+            if (req.socket?.destroyed) return  // don't write to destroyed socket
             sendJson(res, result)
             return
           }
@@ -211,9 +214,33 @@ function sqliteApiPlugin(): Plugin {
               propertyFilters: string[]
               columns: string[]
             }
+            const isCancelled = () => !!(req.socket?.destroyed)
             const result = db.aggregateChartData(
               body.datasets, body.query, body.propertyFilters, body.columns,
+              20, 15, isCancelled,
             )
+            if (req.socket?.destroyed) return  // don't write to destroyed socket
+            sendJson(res, result)
+            return
+          }
+
+          // ── POST /api/db/export (all matching records for selected columns)
+          if (pathname === '/api/db/export' && req.method === 'POST') {
+            const body = (await parseJsonBody(req)) as {
+              datasets: { id: string; offset: number; count: number }[]
+              query: string
+              propertyFilters: string[]
+              sortColumn: string
+              sortDirection: 'asc' | 'desc'
+              columns: string[]
+            }
+            const isCancelled = () => !!(req.socket?.destroyed)
+            const result = db.exportRecords(
+              body.datasets, body.query, body.propertyFilters,
+              body.sortColumn, body.sortDirection, body.columns,
+              isCancelled,
+            )
+            if (req.socket?.destroyed) return
             sendJson(res, result)
             return
           }

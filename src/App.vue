@@ -23,6 +23,7 @@ import LoadingFooter from './components/LoadingFooter.vue'
 import DatasetManager from './components/DatasetManager.vue'
 import FilterModal from './components/FilterModal.vue'
 import ChartModal from './components/ChartModal.vue'
+import ExportButton from './components/ExportButton.vue'
 
 import { useParser } from './composables/useParser'
 import { useDatasets } from './composables/useDatasets'
@@ -431,6 +432,18 @@ onBeforeUnmount(() => {
             </svg>
             <span class="hidden sm:inline">Charts</span>
           </button>
+
+          <!-- Export button -->
+          <ExportButton
+            v-if="isDataReady"
+            :columns="visibleColumns"
+            :search-query="searchQuery"
+            :property-filters="propertyFilters"
+            :dataset-ranges="effectiveRanges"
+            :sort-column="sortColumn"
+            :sort-direction="sortDirection"
+            :total-count="matchCount"
+          />
 
           <!-- Filter button -->
           <button

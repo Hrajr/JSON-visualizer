@@ -126,11 +126,13 @@ export async function queryPage(
   sortDirection: 'asc' | 'desc',
   page: number,
   pageSize: number,
+  signal?: AbortSignal,
 ): Promise<QueryPageResult> {
   const res = await fetch('/api/db/query', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ datasets, query, propertyFilters, sortColumn, sortDirection, page, pageSize }),
+    signal,
   })
   return res.json()
 }
@@ -176,11 +178,38 @@ export async function fetchChartData(
   query: string,
   propertyFilters: string[],
   columns: string[],
+  signal?: AbortSignal,
 ): Promise<ChartDataResult> {
   const res = await fetch('/api/db/chart-data', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ datasets, query, propertyFilters, columns }),
+    signal,
+  })
+  return res.json()
+}
+
+// ── Server API: Export all matching records ──
+
+export interface ExportResult {
+  records: Record<string, unknown>[]
+  totalCount: number
+}
+
+export async function fetchExportData(
+  datasets: { id: string; offset: number; count: number }[],
+  query: string,
+  propertyFilters: string[],
+  sortColumn: string,
+  sortDirection: 'asc' | 'desc',
+  columns: string[],
+  signal?: AbortSignal,
+): Promise<ExportResult> {
+  const res = await fetch('/api/db/export', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ datasets, query, propertyFilters, sortColumn, sortDirection, columns }),
+    signal,
   })
   return res.json()
 }

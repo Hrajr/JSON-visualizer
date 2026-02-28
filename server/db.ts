@@ -22,6 +22,8 @@ function ensureDir(): void {
 // ── Database connection cache ──
 
 const openDBs = new Map<string, Database.Database>()
+const migratedDBs = new Set<string>()
+const propIndexBuilt = new Map<string, Set<string>>()
 
 function getDB(id: string): Database.Database {
   let db = openDBs.get(id)
@@ -38,12 +40,14 @@ function getDB(id: string): Database.Database {
 
 function closeDB(id: string): void {
   const db = openDBs.get(id)
-  if (db) { db.close(); openDBs.delete(id) }
+  if (db) { db.close(); openDBs.delete(id); migratedDBs.delete(id); propIndexBuilt.delete(id) }
 }
 
 function closeAllDBs(): void {
   for (const [, db] of openDBs) db.close()
   openDBs.clear()
+  migratedDBs.clear()
+  propIndexBuilt.clear()
 }
 
 // ── Metadata management ──
@@ -158,6 +162,78 @@ function ensureMetaSync(): DatasetMeta[] {
 
 // ── Public API ──
 
+/**
+ * Build a compact pipe-delimited string of property keys that have
+ * non-null, non-empty values.  e.g. "|name|age|city|"
+ * Used for fast property-existence filtering without parsing JSON.
+ */
+function buildPropKeys(record: Record<string, unknown>): string {
+  const keys: string[] = []
+  for (const [key, val] of Object.entries(record)) {
+    if (val !== null && val !== undefined && val !== '') {
+      keys.push(key)
+    }
+  }
+  return keys.length > 0 ? '|' + keys.join('|') + '|' : ''
+}
+
+/**
+ * Ensure the `prop_keys` column exists on the records table.
+ * Only adds the column if missing — NO backfill. Property filtering
+ * uses the separate _prop_cache index instead (see ensurePropIndex).
+ */
+function ensurePropKeys(db: Database.Database, id: string): void {
+  if (migratedDBs.has(id)) return
+  const cols = db.prepare("PRAGMA table_info('records')").all() as { name: string }[]
+  if (!cols.some(c => c.name === 'prop_keys')) {
+    db.exec("ALTER TABLE records ADD COLUMN prop_keys TEXT NOT NULL DEFAULT ''")
+  }
+  migratedDBs.add(id)
+}
+
+/**
+ * Ensure a per-property index exists for fast property-existence filtering.
+ *
+ * Uses a `_prop_cache(prop, idx)` table with a compound PRIMARY KEY.
+ * Built lazily per property via a single INSERT...SELECT that runs
+ * entirely inside SQLite's C engine — no JS per-row overhead.
+ *
+ * First filter on a new property: ~3-8 seconds per 1M rows.
+ * All subsequent queries on the same property: instant (indexed lookup).
+ */
+function ensurePropIndex(db: Database.Database, datasetId: string, prop: string): void {
+  let indexed = propIndexBuilt.get(datasetId)
+  if (indexed?.has(prop)) return
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS _prop_cache (
+      prop TEXT NOT NULL,
+      idx INTEGER NOT NULL,
+      PRIMARY KEY (prop, idx)
+    ) WITHOUT ROWID
+  `)
+  db.exec('CREATE TABLE IF NOT EXISTS _prop_cache_done (prop TEXT PRIMARY KEY)')
+
+  // Check if already built (persisted from a previous run)
+  const done = db.prepare('SELECT 1 FROM _prop_cache_done WHERE prop = ?').get(prop)
+
+  if (!done) {
+    const start = performance.now()
+    // Single SQL statement — all scanning + filtering in C, no JS overhead
+    db.prepare(
+      `INSERT INTO _prop_cache (prop, idx)
+       SELECT ?, idx FROM records
+       WHERE NULLIF(json_extract(data, ?), '') IS NOT NULL`,
+    ).run(prop, `$.${prop}`)
+    db.prepare('INSERT OR IGNORE INTO _prop_cache_done VALUES (?)').run(prop)
+    const ms = (performance.now() - start).toFixed(0)
+    console.log(`[SQLite] Built prop index "${prop}" on ${datasetId} (${ms}ms)`)
+  }
+
+  if (!indexed) { indexed = new Set(); propIndexBuilt.set(datasetId, indexed) }
+  indexed.add(prop)
+}
+
 /** Create a new dataset database with the records table + FTS5 index. */
 export function createDataset(id: string, fileName: string, totalBytes: number): void {
   const db = getDB(id)
@@ -165,7 +241,8 @@ export function createDataset(id: string, fileName: string, totalBytes: number):
     CREATE TABLE IF NOT EXISTS records (
       idx INTEGER PRIMARY KEY,
       data TEXT NOT NULL,
-      search_text TEXT NOT NULL
+      search_text TEXT NOT NULL,
+      prop_keys TEXT NOT NULL DEFAULT ''
     )
   `)
 
@@ -209,17 +286,19 @@ export function insertRecords(
 ): number {
   const db = getDB(id)
 
-  // Ensure table exists
+  // Ensure table exists (with prop_keys column)
   db.exec(`
     CREATE TABLE IF NOT EXISTS records (
       idx INTEGER PRIMARY KEY,
       data TEXT NOT NULL,
-      search_text TEXT NOT NULL
+      search_text TEXT NOT NULL,
+      prop_keys TEXT NOT NULL DEFAULT ''
     )
   `)
+  ensurePropKeys(db, id)
 
   const insert = db.prepare(
-    'INSERT OR REPLACE INTO records (idx, data, search_text) VALUES (?, ?, ?)',
+    'INSERT OR REPLACE INTO records (idx, data, search_text, prop_keys) VALUES (?, ?, ?, ?)',
   )
 
   // Check if FTS table exists for this database
@@ -235,7 +314,8 @@ export function insertRecords(
       const record = recs[i]
       const data = JSON.stringify(record)
       const searchText = buildSearchText(record)
-      insert.run(startIndex + i, data, searchText)
+      const propKeys = buildPropKeys(record)
+      insert.run(startIndex + i, data, searchText, propKeys)
       if (ftsInsert) ftsInsert.run(startIndex + i, searchText)
     }
   })
@@ -391,7 +471,7 @@ function escapeFtsTerm(term: string): string {
   return words
     .map(w => {
       // Strip characters that have special meaning in FTS5 queries
-      const clean = w.replace(/["*^():{}<>]/g, '')
+      const clean = w.replace(/["*^():{}<>.+\-~@#$%&|!\[\]\\\/]/g, '')
       return clean.length > 0 ? clean + '*' : ''
     })
     .filter(Boolean)
@@ -436,13 +516,14 @@ export function searchRecords(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='records_fts'",
       ).get()
 
-      // Build property-filter conditions — single json_extract call per property.
-      // IFNULL handles both missing keys (SQL NULL) and JSON null values.
+      // Property-existence checks — direct json_extract, no pre-computation
       const propConditions: string[] = []
       const propParams: unknown[] = []
-      for (const prop of propertyFilters) {
-        propConditions.push(`IFNULL(json_extract(data, ?), '') != ''`)
-        propParams.push(`$.${prop}`)
+      if (propertyFilters.length > 0) {
+        for (const prop of propertyFilters) {
+          propConditions.push("json_extract(data, ?) IS NOT NULL AND json_extract(data, ?) != ''")
+          propParams.push(`$.${prop}`, `$.${prop}`)
+        }
       }
 
       let rows: { idx: number }[]
@@ -626,6 +707,7 @@ export function aggregateChartData(
   columns: string[],
   maxTopValues = 20,
   histogramBuckets = 15,
+  isCancelled?: () => boolean,
 ): { columns: ColumnStats[]; totalRecords: number; timeTaken: number } {
   const start = performance.now()
   const trimmedQuery = query.trim().toLowerCase()
@@ -653,9 +735,14 @@ export function aggregateChartData(
   let totalRecords = 0
 
   for (const ds of datasets) {
+    // Check if client disconnected before processing each dataset
+    if (isCancelled?.()) {
+      console.log('[SQLite] Chart aggregation cancelled — client disconnected')
+      break
+    }
     try {
       const db = getDB(ds.id)
-      const { conditions, params } = buildWhereClause(db, terms, propertyFilters)
+      const { conditions, params } = buildWhereClause(db, ds.id, terms, propertyFilters)
       const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
 
       // ── Step 1: Create temp table and extract all column values in ONE pass ──
@@ -761,9 +848,10 @@ export function aggregateChartData(
 
         // Re-extract only this numeric column for histogram bucketing
         for (const ds of datasets) {
+          if (isCancelled?.()) break
           try {
             const db = getDB(ds.id)
-            const { conditions, params } = buildWhereClause(db, terms, propertyFilters)
+            const { conditions, params } = buildWhereClause(db, ds.id, terms, propertyFilters)
             const jsonPath = `$.${col}`
 
             // Build WHERE that includes search/filter + numeric type check
@@ -836,6 +924,7 @@ export interface QueryResult {
  */
 function buildWhereClause(
   dbInstance: Database.Database,
+  datasetId: string,
   terms: string[],
   propertyFilters: string[],
 ): {
@@ -872,10 +961,13 @@ function buildWhereClause(
     }
   }
 
-  // Property filters
-  for (const prop of propertyFilters) {
-    conditions.push(`IFNULL(json_extract(data, ?), '') != ''`)
-    params.push(`$.${prop}`)
+  // Property filters — direct json_extract in WHERE clause.
+  // SQLite's json_extract runs in C and with LIMIT stops early.
+  if (propertyFilters.length > 0) {
+    for (const prop of propertyFilters) {
+      conditions.push("json_extract(data, ?) IS NOT NULL AND json_extract(data, ?) != ''")
+      params.push(`$.${prop}`, `$.${prop}`)
+    }
   }
 
   return { conditions, params, ftsQuery, hasFts }
@@ -898,6 +990,7 @@ export function queryRecords(
   sortDirection: 'asc' | 'desc',
   page: number,
   pageSize: number,
+  isCancelled?: () => boolean,
 ): QueryResult {
   const start = performance.now()
   const trimmedQuery = query.trim().toLowerCase()
@@ -913,7 +1006,7 @@ export function queryRecords(
     const ds = datasets[0]
     try {
       const db = getDB(ds.id)
-      const { conditions, params } = buildWhereClause(db, terms, propertyFilters)
+      const { conditions, params } = buildWhereClause(db, ds.id, terms, propertyFilters)
       const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
 
       // Count matching records — skip expensive COUNT(*) when no filter
@@ -954,33 +1047,65 @@ export function queryRecords(
   }
 
   // ── Multi-dataset path ──
-  // Two-phase approach to avoid loading all records into memory:
-  //   Phase 1: Collect lightweight (idx, sortVal) from each dataset
-  //   Phase 2: Fetch full data only for the final page
+  // Strategy: per-dataset SQL COUNT + LIMIT/OFFSET.
+  // Never collect all matching indices into memory.
 
-  // When no filter is active, total is the sum of dataset sizes — skip COUNT(*)
-  let totalCount = hasFilter ? 0 : datasets.reduce((s, d) => s + d.count, 0)
+  let totalCount = 0
 
-  if (!hasSort && !hasFilter) {
-    // No filter or sort — use offset-based pagination across datasets
+  // Phase 1: Get per-dataset filtered counts
+  const dsCounts: { ds: typeof datasets[0]; count: number }[] = []
+  for (const ds of datasets) {
+    if (isCancelled?.()) {
+      return { totalCount: 0, records: [], timeTaken: performance.now() - start }
+    }
+    try {
+      const db = getDB(ds.id)
+      const { conditions, params } = buildWhereClause(db, ds.id, terms, propertyFilters)
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+
+      let cnt: number
+      if (!hasFilter) {
+        cnt = ds.count
+      } else {
+        const countRow = db.prepare(
+          `SELECT COUNT(*) as cnt FROM records ${where}`,
+        ).get(...params) as { cnt: number }
+        cnt = countRow.cnt
+      }
+      totalCount += cnt
+      dsCounts.push({ ds, count: cnt })
+    } catch (err) {
+      console.error(`[SQLite] Query error on dataset ${ds.id}:`, err)
+    }
+  }
+
+  // Phase 2: If no sort, use efficient cross-dataset LIMIT/OFFSET
+  if (!hasSort) {
     const pageStart = (page - 1) * pageSize
-    const pageEnd = pageStart + pageSize
     const allRecords: { absIndex: number; data: Record<string, unknown> }[] = []
+    let cumOffset = 0
 
-    for (const ds of datasets) {
+    for (const { ds, count } of dsCounts) {
+      if (isCancelled?.()) break
+      const dsStart = cumOffset
+      const dsEnd = cumOffset + count
+      cumOffset += count
+
+      // Skip datasets that don't overlap with the requested page
+      if (pageStart + pageSize <= dsStart || pageStart >= dsEnd) continue
+
+      const localOffset = Math.max(0, pageStart - dsStart)
+      const localLimit = Math.min(pageSize - allRecords.length, dsEnd - Math.max(pageStart, dsStart))
+      if (localLimit <= 0) continue
+
       try {
         const db = getDB(ds.id)
-        const dsStart = ds.offset
-        const dsEnd = ds.offset + ds.count
-
-        if (pageEnd <= dsStart || pageStart >= dsEnd) continue
-
-        const localOffset = Math.max(0, pageStart - dsStart)
-        const localLimit = Math.min(pageSize, dsEnd - Math.max(pageStart, dsStart))
+        const { conditions, params } = buildWhereClause(db, ds.id, terms, propertyFilters)
+        const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
 
         const rows = db.prepare(
-          'SELECT idx, data FROM records ORDER BY idx LIMIT ? OFFSET ?',
-        ).all(localLimit, localOffset) as { idx: number; data: string }[]
+          `SELECT idx, data FROM records ${where} ORDER BY idx LIMIT ? OFFSET ?`,
+        ).all(...params, localLimit, localOffset) as { idx: number; data: string }[]
 
         for (const row of rows) {
           allRecords.push({
@@ -991,71 +1116,65 @@ export function queryRecords(
       } catch (err) {
         console.error(`[SQLite] Query error on dataset ${ds.id}:`, err)
       }
+
+      if (allRecords.length >= pageSize) break
     }
 
     return { totalCount, records: allRecords, timeTaken: performance.now() - start }
   }
 
-  // ── Phase 1: Collect lightweight index + sort value (NO full data) ──
-  const allEntries: { absIndex: number; dsId: string; localIdx: number; sortVal?: unknown }[] = []
+  // Phase 3: With sort — need to merge-sort across datasets.
+  // Fetch (pageStart + pageSize) from EACH dataset sorted by sortColumn,
+  // merge, then take the page slice. Only fetch data for final page.
+  const needed = (page - 1) * pageSize + pageSize
+  const perDsEntries: { absIndex: number; dsId: string; localIdx: number; sortVal: unknown }[][] = []
 
-  for (const ds of datasets) {
+  for (const { ds } of dsCounts) {
+    if (isCancelled?.()) {
+      return { totalCount, records: [], timeTaken: performance.now() - start }
+    }
     try {
       const db = getDB(ds.id)
-      const { conditions, params } = buildWhereClause(db, terms, propertyFilters)
+      const { conditions, params } = buildWhereClause(db, ds.id, terms, propertyFilters)
       const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
 
-      // Count only when filters are active
-      if (hasFilter) {
-        const countRow = db.prepare(
-          `SELECT COUNT(*) as cnt FROM records ${where}`,
-        ).get(...params) as { cnt: number }
-        totalCount += countRow.cnt
-      }
-
-      // Fetch only idx (and sort_val if sorting) — never fetch data column here
-      const selectCols = hasSort
-        ? `idx, json_extract(data, ?) as sort_val`
-        : 'idx'
-      const sortParams = hasSort ? [`$.${sortColumn}`] : []
-
+      // Only fetch 'needed' rows from each dataset, already sorted in SQL
+      const dir = sortDirection === 'desc' ? 'DESC' : 'ASC'
       const rows = db.prepare(
-        `SELECT ${selectCols} FROM records ${where} ORDER BY idx`,
-      ).all(...sortParams, ...params) as { idx: number; sort_val?: unknown }[]
+        `SELECT idx, json_extract(data, ?) as sort_val FROM records ${where}
+         ORDER BY json_extract(data, ?) ${dir}, idx LIMIT ?`,
+      ).all(`$.${sortColumn}`, ...params, `$.${sortColumn}`, needed) as { idx: number; sort_val: unknown }[]
 
-      for (const row of rows) {
-        allEntries.push({
-          absIndex: row.idx + ds.offset,
-          dsId: ds.id,
-          localIdx: row.idx,
-          sortVal: row.sort_val,
-        })
-      }
+      const entries = rows.map(row => ({
+        absIndex: row.idx + ds.offset,
+        dsId: ds.id,
+        localIdx: row.idx,
+        sortVal: row.sort_val,
+      }))
+      perDsEntries.push(entries)
     } catch (err) {
       console.error(`[SQLite] Query error on dataset ${ds.id}:`, err)
     }
   }
 
-  // Sort if needed (multi-dataset merge) — lightweight: only indexes + sort values
-  if (hasSort) {
-    const mult = sortDirection === 'asc' ? 1 : -1
-    allEntries.sort((a, b) => {
-      const av = a.sortVal
-      const bv = b.sortVal
-      if (av == null && bv == null) return 0
-      if (av == null) return 1
-      if (bv == null) return -1
-      if (typeof av === 'number' && typeof bv === 'number') return mult * (av - bv)
-      return mult * String(av).localeCompare(String(bv), undefined, { sensitivity: 'base', numeric: true })
-    })
-  }
+  // Merge all datasets' sorted results
+  const merged = perDsEntries.flat()
+  const mult = sortDirection === 'asc' ? 1 : -1
+  merged.sort((a, b) => {
+    const av = a.sortVal
+    const bv = b.sortVal
+    if (av == null && bv == null) return 0
+    if (av == null) return 1
+    if (bv == null) return -1
+    if (typeof av === 'number' && typeof bv === 'number') return mult * (av - bv)
+    return mult * String(av).localeCompare(String(bv), undefined, { sensitivity: 'base', numeric: true })
+  })
 
-  // Paginate — only the page slice
+  // Paginate the merged results
   const offset = (page - 1) * pageSize
-  const pageEntries = allEntries.slice(offset, offset + pageSize)
+  const pageEntries = merged.slice(offset, offset + pageSize)
 
-  // ── Phase 2: Fetch full data only for the page records ──
-  // Group page entries by dataset for efficient batch fetch
+  // Fetch full data only for the page records
   const groupedByDs = new Map<string, { absIndex: number; localIdx: number }[]>()
   for (const entry of pageEntries) {
     let arr = groupedByDs.get(entry.dsId)
@@ -1078,4 +1197,91 @@ export function queryRecords(
   }))
 
   return { totalCount, records: pageRecords, timeTaken: performance.now() - start }
+}
+
+/**
+ * Export ALL matching records for the given columns.
+ * Used by CSV/PDF export. Fetches in internal batches to avoid OOM.
+ * Only extracts the requested columns, not the full JSON blob.
+ */
+export function exportRecords(
+  datasets: { id: string; offset: number; count: number }[],
+  query: string,
+  propertyFilters: string[],
+  sortColumn: string,
+  sortDirection: 'asc' | 'desc',
+  columns: string[],
+  isCancelled?: () => boolean,
+): { records: Record<string, unknown>[]; totalCount: number } {
+  const trimmedQuery = query.trim().toLowerCase()
+  const terms = trimmedQuery
+    ? trimmedQuery.split(',').map(t => t.trim()).filter(Boolean)
+    : []
+
+  const hasSort = sortColumn !== ''
+  const allRecords: { absIndex: number; sortVal?: unknown; data: Record<string, unknown> }[] = []
+
+  for (const ds of datasets) {
+    if (isCancelled?.()) break
+    try {
+      const db = getDB(ds.id)
+      const { conditions, params } = buildWhereClause(db, ds.id, terms, propertyFilters)
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+
+      // Only extract the columns we need (plus sort column if sorting)
+      const jsonExtracts = columns.map(c => `json_extract(data, ?) as [${c}]`).join(', ')
+      const jsonParams = columns.map(c => `$.${c}`)
+
+      let orderBy = 'ORDER BY idx'
+      const orderParams: unknown[] = []
+      let sortExtract = ''
+      if (hasSort && !columns.includes(sortColumn)) {
+        sortExtract = `, json_extract(data, ?) as [__sort__]`
+        orderParams.push(`$.${sortColumn}`)
+      }
+      if (hasSort) {
+        orderBy = `ORDER BY json_extract(data, ?) ${sortDirection === 'desc' ? 'DESC' : 'ASC'}, idx`
+        orderParams.push(`$.${sortColumn}`)
+      }
+
+      const sql = `SELECT idx, ${jsonExtracts}${sortExtract} FROM records ${where} ${orderBy}`
+      const rows = db.prepare(sql).all(
+        ...jsonParams, ...(sortExtract ? [orderParams[0]] : []), ...params,
+        ...(hasSort ? [orderParams[orderParams.length - 1]] : []),
+      ) as Record<string, unknown>[]
+
+      for (const row of rows) {
+        const data: Record<string, unknown> = {}
+        for (const col of columns) {
+          data[col] = row[col]
+        }
+        allRecords.push({
+          absIndex: (row.idx as number) + ds.offset,
+          sortVal: hasSort ? (row[sortColumn] ?? row['__sort__']) : undefined,
+          data,
+        })
+      }
+    } catch (err) {
+      console.error(`[SQLite] Export error on dataset ${ds.id}:`, err)
+    }
+  }
+
+  // If multi-dataset + sort, merge-sort across datasets
+  if (datasets.length > 1 && hasSort) {
+    const mult = sortDirection === 'asc' ? 1 : -1
+    allRecords.sort((a, b) => {
+      const av = a.sortVal
+      const bv = b.sortVal
+      if (av == null && bv == null) return 0
+      if (av == null) return 1
+      if (bv == null) return -1
+      if (typeof av === 'number' && typeof bv === 'number') return mult * (av - bv)
+      return mult * String(av).localeCompare(String(bv), undefined, { sensitivity: 'base', numeric: true })
+    })
+  }
+
+  return {
+    records: allRecords.map(r => r.data),
+    totalCount: allRecords.length,
+  }
 }

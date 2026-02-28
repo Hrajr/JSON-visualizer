@@ -40,6 +40,9 @@ const errorMessage = ref('')
 // Chart instance tracking for cleanup
 const chartInstances = new Map<string, Chart>()
 
+// Abort controller for in-flight chart data requests
+let chartAbortController: AbortController | null = null
+
 const filteredKeys = computed(() => {
   const q = columnSearchText.value.toLowerCase().trim()
   if (!q) return props.allKeys
@@ -65,6 +68,12 @@ watch(() => props.open, (val) => {
       loadChartData()
     }
   } else {
+    // Abort any in-flight request when modal closes
+    if (chartAbortController) {
+      chartAbortController.abort()
+      chartAbortController = null
+    }
+    isLoading.value = false
     destroyAllCharts()
   }
 })
@@ -97,6 +106,12 @@ function clearColumns() {
 // ── Data fetching ──
 async function loadChartData() {
   if (selectedColumns.value.length === 0) return
+
+  // Abort any previous in-flight request
+  if (chartAbortController) chartAbortController.abort()
+  chartAbortController = new AbortController()
+  const signal = chartAbortController.signal
+
   isLoading.value = true
   errorMessage.value = ''
 
@@ -107,15 +122,18 @@ async function loadChartData() {
       props.searchQuery,
       props.propertyFilters,
       selectedColumns.value,
+      signal,
     )
+    if (signal.aborted) return
     chartData.value = result.columns
     totalRecords.value = result.totalRecords
     timeTaken.value = Math.round(result.timeTaken * 100) / 100
   } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') return
     console.error('[ChartModal]', err)
     errorMessage.value = 'Failed to load chart data. Please try again.'
   } finally {
-    isLoading.value = false
+    if (!signal.aborted) isLoading.value = false
   }
   // Render after isLoading is false so canvas elements are in the DOM
   await nextTick()
@@ -352,6 +370,10 @@ function onBackdrop() {
 }
 
 onBeforeUnmount(() => {
+  if (chartAbortController) {
+    chartAbortController.abort()
+    chartAbortController = null
+  }
   destroyAllCharts()
 })
 </script>

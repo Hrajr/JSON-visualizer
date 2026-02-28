@@ -48,6 +48,7 @@ export function useSearch(totalCount: Ref<number>, datasetRanges: Ref<DatasetRan
 
   let queryGeneration = 0
   let fetchTimer: ReturnType<typeof setTimeout> | null = null
+  let fetchAbortController: AbortController | null = null
 
   /**
    * Schedule a fetchPage with debounce.  Multiple callers within the
@@ -71,6 +72,11 @@ export function useSearch(totalCount: Ref<number>, datasetRanges: Ref<DatasetRan
     const gen = ++queryGeneration
     const datasets = datasetRanges.value.map(r => ({ id: r.id, offset: r.offset, count: r.count }))
 
+    // Abort any previous in-flight request
+    if (fetchAbortController) fetchAbortController.abort()
+    fetchAbortController = new AbortController()
+    const signal = fetchAbortController.signal
+
     if (datasets.length === 0) {
       pageRecords.value = []
       matchCount.value = 0
@@ -88,6 +94,7 @@ export function useSearch(totalCount: Ref<number>, datasetRanges: Ref<DatasetRan
         sortDirection.value,
         page.value,
         pageSize.value,
+        signal,
       )
 
       if (gen !== queryGeneration) return // stale response
@@ -96,6 +103,7 @@ export function useSearch(totalCount: Ref<number>, datasetRanges: Ref<DatasetRan
       pageRecords.value = result.records
       searchTime.value = Math.round(result.timeTaken * 100) / 100
     } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return
       if (gen !== queryGeneration) return
       console.error('[Query]', err)
     } finally {
@@ -170,6 +178,7 @@ export function useSearch(totalCount: Ref<number>, datasetRanges: Ref<DatasetRan
 
   function dispose() {
     if (fetchTimer) clearTimeout(fetchTimer)
+    if (fetchAbortController) fetchAbortController.abort()
   }
 
   return {
