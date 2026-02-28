@@ -213,9 +213,9 @@ watch(parserState, (state) => {
 })
 
 // ── Parser completion callback ──
-onParserComplete((info) => {
+onParserComplete(async (info) => {
   const isBatch = batchTotal.value > 1
-  addDataset(info, !isBatch) // Don't change active selection during batch
+  await addDataset(info, !isBatch) // Await so datasets.value is current before setActiveIds
   batchLoadedIds.value.push(info.id)
 
   // If there are more files in the queue, start the next one
@@ -246,9 +246,13 @@ async function onLoadFile(file: File) {
   propertyFilters.value = []
   resetSort()
 
-  // Terminate workers & delete ALL old datasets
+  // Clear active selection synchronously so the search/table stops
+  // referencing old datasets during the transition. Old datasets remain
+  // on the server and in the DatasetManager for re-activation later.
+  setActiveIds([])
+
+  // Terminate any in-progress worker
   resetParser()
-  await clearAllDatasets()
 
   urlQueue.value = []
   batchLoadedIds.value = []
@@ -267,9 +271,12 @@ async function onLoadUrls(files: { url: string; name: string }[]) {
   propertyFilters.value = []
   resetSort()
 
-  // Terminate workers & delete ALL old datasets
+  // Clear active selection synchronously so the search/table stops
+  // referencing old datasets during the transition.
+  setActiveIds([])
+
+  // Terminate any in-progress worker
   resetParser()
-  await clearAllDatasets()
 
   // Queue all files, start the first one
   const [first, ...rest] = files

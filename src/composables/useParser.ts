@@ -32,7 +32,7 @@ export function useParser() {
   let _currentDatasetId = ''
 
   /** Called when parsing completes successfully. */
-  let onCompleteCallback: ((info: DatasetInfo) => void) | null = null
+  let onCompleteCallback: ((info: DatasetInfo) => void | Promise<void>) | null = null
 
   const progress = computed(() => {
     if (totalBytes.value === 0) return 0
@@ -98,7 +98,7 @@ export function useParser() {
               info.keys,
               info.totalBytes,
             )
-            if (onCompleteCallback) onCompleteCallback(info)
+            if (onCompleteCallback) await onCompleteCallback(info)
           } catch (err) {
             console.error('onComplete callback error:', err)
             state.value = 'error'
@@ -119,7 +119,7 @@ export function useParser() {
               info.keys,
               info.totalBytes,
             )
-            if (onCompleteCallback) onCompleteCallback(info)
+            if (onCompleteCallback) await onCompleteCallback(info)
           } catch (err) {
             console.error('onComplete callback error:', err)
             state.value = 'error'
@@ -210,7 +210,7 @@ export function useParser() {
     currentDatasetId.value = ''
   }
 
-  function onComplete(cb: (info: DatasetInfo) => void) {
+  function onComplete(cb: (info: DatasetInfo) => void | Promise<void>) {
     onCompleteCallback = cb
   }
 

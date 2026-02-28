@@ -932,30 +932,22 @@ export function queryRecords(
   }
 
   // ── Multi-dataset path ──
-  // Collect all matching records across datasets, then sort & paginate in JS
-  const allRecords: { absIndex: number; data: Record<string, unknown>; sortVal?: unknown }[] = []
+  // Two-phase approach to avoid loading all records into memory:
+  //   Phase 1: Collect lightweight (idx, sortVal) from each dataset
+  //   Phase 2: Fetch full data only for the final page
+
   // When no filter is active, total is the sum of dataset sizes — skip COUNT(*)
   let totalCount = hasFilter ? 0 : datasets.reduce((s, d) => s + d.count, 0)
 
-  for (const ds of datasets) {
-    try {
-      const db = getDB(ds.id)
-      const { conditions, params } = buildWhereClause(db, terms, propertyFilters)
-      const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+  if (!hasSort && !hasFilter) {
+    // No filter or sort — use offset-based pagination across datasets
+    const pageStart = (page - 1) * pageSize
+    const pageEnd = pageStart + pageSize
+    const allRecords: { absIndex: number; data: Record<string, unknown> }[] = []
 
-      // Count only when filters are active
-      if (hasFilter) {
-        const countRow = db.prepare(
-          `SELECT COUNT(*) as cnt FROM records ${where}`,
-        ).get(...params) as { cnt: number }
-        totalCount += countRow.cnt
-      }
-
-      if (!hasSort && !hasFilter) {
-        // No filter or sort — use offset-based pagination across datasets
-        // Skip this dataset if the page doesn't fall within it
-        const pageStart = (page - 1) * pageSize
-        const pageEnd = pageStart + pageSize
+    for (const ds of datasets) {
+      try {
+        const db = getDB(ds.id)
         const dsStart = ds.offset
         const dsEnd = ds.offset + ds.count
 
@@ -974,34 +966,58 @@ export function queryRecords(
             data: JSON.parse(row.data),
           })
         }
-      } else {
-        // With filter/sort — fetch all matching from this dataset
-        const selectCols = hasSort
-          ? `idx, data, json_extract(data, ?) as sort_val`
-          : 'idx, data'
-        const sortParams = hasSort ? [`$.${sortColumn}`] : []
+      } catch (err) {
+        console.error(`[SQLite] Query error on dataset ${ds.id}:`, err)
+      }
+    }
 
-        const rows = db.prepare(
-          `SELECT ${selectCols} FROM records ${where} ORDER BY idx`,
-        ).all(...sortParams, ...params) as { idx: number; data: string; sort_val?: unknown }[]
+    return { totalCount, records: allRecords, timeTaken: performance.now() - start }
+  }
 
-        for (const row of rows) {
-          allRecords.push({
-            absIndex: row.idx + ds.offset,
-            data: JSON.parse(row.data),
-            sortVal: row.sort_val,
-          })
-        }
+  // ── Phase 1: Collect lightweight index + sort value (NO full data) ──
+  const allEntries: { absIndex: number; dsId: string; localIdx: number; sortVal?: unknown }[] = []
+
+  for (const ds of datasets) {
+    try {
+      const db = getDB(ds.id)
+      const { conditions, params } = buildWhereClause(db, terms, propertyFilters)
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+
+      // Count only when filters are active
+      if (hasFilter) {
+        const countRow = db.prepare(
+          `SELECT COUNT(*) as cnt FROM records ${where}`,
+        ).get(...params) as { cnt: number }
+        totalCount += countRow.cnt
+      }
+
+      // Fetch only idx (and sort_val if sorting) — never fetch data column here
+      const selectCols = hasSort
+        ? `idx, json_extract(data, ?) as sort_val`
+        : 'idx'
+      const sortParams = hasSort ? [`$.${sortColumn}`] : []
+
+      const rows = db.prepare(
+        `SELECT ${selectCols} FROM records ${where} ORDER BY idx`,
+      ).all(...sortParams, ...params) as { idx: number; sort_val?: unknown }[]
+
+      for (const row of rows) {
+        allEntries.push({
+          absIndex: row.idx + ds.offset,
+          dsId: ds.id,
+          localIdx: row.idx,
+          sortVal: row.sort_val,
+        })
       }
     } catch (err) {
       console.error(`[SQLite] Query error on dataset ${ds.id}:`, err)
     }
   }
 
-  // Sort if needed (multi-dataset merge)
+  // Sort if needed (multi-dataset merge) — lightweight: only indexes + sort values
   if (hasSort) {
     const mult = sortDirection === 'asc' ? 1 : -1
-    allRecords.sort((a, b) => {
+    allEntries.sort((a, b) => {
       const av = a.sortVal
       const bv = b.sortVal
       if (av == null && bv == null) return 0
@@ -1012,11 +1028,31 @@ export function queryRecords(
     })
   }
 
-  // Paginate
+  // Paginate — only the page slice
   const offset = (page - 1) * pageSize
-  const pageRecords = allRecords.slice(offset, offset + pageSize).map(r => ({
-    absIndex: r.absIndex,
-    data: r.data,
+  const pageEntries = allEntries.slice(offset, offset + pageSize)
+
+  // ── Phase 2: Fetch full data only for the page records ──
+  // Group page entries by dataset for efficient batch fetch
+  const groupedByDs = new Map<string, { absIndex: number; localIdx: number }[]>()
+  for (const entry of pageEntries) {
+    let arr = groupedByDs.get(entry.dsId)
+    if (!arr) { arr = []; groupedByDs.set(entry.dsId, arr) }
+    arr.push({ absIndex: entry.absIndex, localIdx: entry.localIdx })
+  }
+
+  const dataMap = new Map<number, Record<string, unknown>>()
+  for (const [dsId, items] of groupedByDs) {
+    const localIndices = items.map(it => it.localIdx)
+    const records = getRecords(dsId, localIndices)
+    for (let j = 0; j < items.length; j++) {
+      if (records[j]) dataMap.set(items[j].absIndex, records[j]!)
+    }
+  }
+
+  const pageRecords = pageEntries.map(entry => ({
+    absIndex: entry.absIndex,
+    data: dataMap.get(entry.absIndex) ?? {},
   }))
 
   return { totalCount, records: pageRecords, timeTaken: performance.now() - start }
