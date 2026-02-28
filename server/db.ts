@@ -24,6 +24,8 @@ function ensureDir(): void {
 const openDBs = new Map<string, Database.Database>()
 const migratedDBs = new Set<string>()
 const propIndexBuilt = new Map<string, Set<string>>()
+/** Tracks whether a dataset's prop_keys column is usable (populated). */
+const propKeysUsable = new Map<string, boolean>()
 
 function getDB(id: string): Database.Database {
   let db = openDBs.get(id)
@@ -40,7 +42,7 @@ function getDB(id: string): Database.Database {
 
 function closeDB(id: string): void {
   const db = openDBs.get(id)
-  if (db) { db.close(); openDBs.delete(id); migratedDBs.delete(id); propIndexBuilt.delete(id) }
+  if (db) { db.close(); openDBs.delete(id); migratedDBs.delete(id); propIndexBuilt.delete(id); propKeysUsable.delete(id) }
 }
 
 function closeAllDBs(): void {
@@ -48,6 +50,7 @@ function closeAllDBs(): void {
   openDBs.clear()
   migratedDBs.clear()
   propIndexBuilt.clear()
+  propKeysUsable.clear()
 }
 
 // ── Metadata management ──
@@ -188,7 +191,26 @@ function ensurePropKeys(db: Database.Database, id: string): void {
   if (!cols.some(c => c.name === 'prop_keys')) {
     db.exec("ALTER TABLE records ADD COLUMN prop_keys TEXT NOT NULL DEFAULT ''")
   }
+  // Covering index on prop_keys — lets COUNT queries read only the small
+  // index entries (~200 B) instead of the full multi-KB table rows.
+  db.exec('CREATE INDEX IF NOT EXISTS idx_prop_keys ON records(prop_keys)')
   migratedDBs.add(id)
+}
+
+/**
+ * Check if the prop_keys column has actual data (not all empty).
+ * Cached per-session per-dataset. Returns false for legacy databases
+ * where prop_keys was added but never populated.
+ */
+function isPropKeysPopulated(db: Database.Database, datasetId: string): boolean {
+  let populated = propKeysUsable.get(datasetId)
+  if (populated !== undefined) return populated
+  const sample = db.prepare(
+    "SELECT 1 FROM records WHERE prop_keys != '' LIMIT 1",
+  ).get()
+  populated = !!sample
+  propKeysUsable.set(datasetId, populated)
+  return populated
 }
 
 /**
@@ -339,6 +361,15 @@ export function finalizeDataset(
     meta[idx].totalBytes = totalBytes
   }
   writeMeta(meta)
+
+  // Create covering index on prop_keys after all records are inserted.
+  // This makes COUNT queries with property filters much faster.
+  try {
+    const db = getDB(id)
+    db.exec('CREATE INDEX IF NOT EXISTS idx_prop_keys ON records(prop_keys)')
+  } catch (err) {
+    console.warn('[SQLite] Could not create prop_keys index:', err)
+  }
 }
 
 /** Get all datasets. Auto-recovers metadata from .db files if _meta.json is missing/incomplete. */
@@ -751,7 +782,7 @@ export function aggregateChartData(
       db.exec(`CREATE TEMP TABLE _chart_extract (${columns.map((_, i) => `c${i}`).join(', ')})`)
 
       // Single INSERT that does one json_extract per column per row
-      const jsonExtracts = columns.map((col, i) => `json_extract(data, ?)`).join(', ')
+      const jsonExtracts = columns.map(() => `json_extract(data, ?)`).join(', ')
       const jsonParams = columns.map(c => `$.${c}`)
 
       db.prepare(
@@ -974,6 +1005,31 @@ function buildWhereClause(
 }
 
 /**
+ * Build a lightweight WHERE clause for COUNT queries when only property
+ * filters are active. Uses the prop_keys column + covering index instead
+ * of json_extract, avoiding JSON parsing on every row.
+ * Returns null if prop_keys is not available (caller should fall back).
+ */
+function buildFastCountWhere(
+  dbInstance: Database.Database,
+  datasetId: string,
+  terms: string[],
+  propertyFilters: string[],
+): { where: string; params: unknown[] } | null {
+  // Only optimise pure property-filter counts (no search terms)
+  if (terms.length > 0 || propertyFilters.length === 0) return null
+  if (!isPropKeysPopulated(dbInstance, datasetId)) return null
+
+  const conditions: string[] = []
+  const params: unknown[] = []
+  for (const prop of propertyFilters) {
+    conditions.push('prop_keys LIKE ?')
+    params.push(`%|${prop}|%`)
+  }
+  return { where: `WHERE ${conditions.join(' AND ')}`, params }
+}
+
+/**
  * Server-side paginated query — search + filter + sort + LIMIT/OFFSET.
  *
  * Returns only the records for the requested page plus the total count of
@@ -1014,10 +1070,19 @@ export function queryRecords(
       if (!hasFilter) {
         totalCount = ds.count
       } else {
-        const countRow = db.prepare(
-          `SELECT COUNT(*) as cnt FROM records ${where}`,
-        ).get(...params) as { cnt: number }
-        totalCount = countRow.cnt
+        // Try fast COUNT using prop_keys index (avoids json_extract per row)
+        const fastCount = buildFastCountWhere(db, ds.id, terms, propertyFilters)
+        if (fastCount) {
+          const countRow = db.prepare(
+            `SELECT COUNT(*) as cnt FROM records ${fastCount.where}`,
+          ).get(...fastCount.params) as { cnt: number }
+          totalCount = countRow.cnt
+        } else {
+          const countRow = db.prepare(
+            `SELECT COUNT(*) as cnt FROM records ${where}`,
+          ).get(...params) as { cnt: number }
+          totalCount = countRow.cnt
+        }
       }
 
       // Build ORDER BY
@@ -1028,11 +1093,17 @@ export function queryRecords(
         orderParams.push(`$.${sortColumn}`)
       }
 
+      // For SELECT with LIMIT, use prop_keys WHERE when possible —
+      // avoids json_extract per scanned row. Falls back to json_extract WHERE otherwise.
+      const fastWhere = buildFastCountWhere(db, ds.id, terms, propertyFilters)
+      const selectWhere = fastWhere ? fastWhere.where : where
+      const selectParams = fastWhere ? fastWhere.params : params
+
       // Fetch page
       const offset = (page - 1) * pageSize
       const rows = db.prepare(
-        `SELECT idx, data FROM records ${where} ${orderBy} LIMIT ? OFFSET ?`,
-      ).all(...params, ...orderParams, pageSize, offset) as { idx: number; data: string }[]
+        `SELECT idx, data FROM records ${selectWhere} ${orderBy} LIMIT ? OFFSET ?`,
+      ).all(...selectParams, ...orderParams, pageSize, offset) as { idx: number; data: string }[]
 
       const records = rows.map(row => ({
         absIndex: row.idx + ds.offset,
@@ -1067,10 +1138,18 @@ export function queryRecords(
       if (!hasFilter) {
         cnt = ds.count
       } else {
-        const countRow = db.prepare(
-          `SELECT COUNT(*) as cnt FROM records ${where}`,
-        ).get(...params) as { cnt: number }
-        cnt = countRow.cnt
+        const fastCount = buildFastCountWhere(db, ds.id, terms, propertyFilters)
+        if (fastCount) {
+          const countRow = db.prepare(
+            `SELECT COUNT(*) as cnt FROM records ${fastCount.where}`,
+          ).get(...fastCount.params) as { cnt: number }
+          cnt = countRow.cnt
+        } else {
+          const countRow = db.prepare(
+            `SELECT COUNT(*) as cnt FROM records ${where}`,
+          ).get(...params) as { cnt: number }
+          cnt = countRow.cnt
+        }
       }
       totalCount += cnt
       dsCounts.push({ ds, count: cnt })
@@ -1102,10 +1181,13 @@ export function queryRecords(
         const db = getDB(ds.id)
         const { conditions, params } = buildWhereClause(db, ds.id, terms, propertyFilters)
         const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+        const fastWhere = buildFastCountWhere(db, ds.id, terms, propertyFilters)
+        const selectWhere = fastWhere ? fastWhere.where : where
+        const selectParams = fastWhere ? fastWhere.params : params
 
         const rows = db.prepare(
-          `SELECT idx, data FROM records ${where} ORDER BY idx LIMIT ? OFFSET ?`,
-        ).all(...params, localLimit, localOffset) as { idx: number; data: string }[]
+          `SELECT idx, data FROM records ${selectWhere} ORDER BY idx LIMIT ? OFFSET ?`,
+        ).all(...selectParams, localLimit, localOffset) as { idx: number; data: string }[]
 
         for (const row of rows) {
           allRecords.push({
@@ -1137,13 +1219,16 @@ export function queryRecords(
       const db = getDB(ds.id)
       const { conditions, params } = buildWhereClause(db, ds.id, terms, propertyFilters)
       const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+      const fastWhere = buildFastCountWhere(db, ds.id, terms, propertyFilters)
+      const selectWhere = fastWhere ? fastWhere.where : where
+      const selectParams = fastWhere ? fastWhere.params : params
 
       // Only fetch 'needed' rows from each dataset, already sorted in SQL
       const dir = sortDirection === 'desc' ? 'DESC' : 'ASC'
       const rows = db.prepare(
-        `SELECT idx, json_extract(data, ?) as sort_val FROM records ${where}
+        `SELECT idx, json_extract(data, ?) as sort_val FROM records ${selectWhere}
          ORDER BY json_extract(data, ?) ${dir}, idx LIMIT ?`,
-      ).all(`$.${sortColumn}`, ...params, `$.${sortColumn}`, needed) as { idx: number; sort_val: unknown }[]
+      ).all(`$.${sortColumn}`, ...selectParams, `$.${sortColumn}`, needed) as { idx: number; sort_val: unknown }[]
 
       const entries = rows.map(row => ({
         absIndex: row.idx + ds.offset,
@@ -1227,6 +1312,10 @@ export function exportRecords(
       const db = getDB(ds.id)
       const { conditions, params } = buildWhereClause(db, ds.id, terms, propertyFilters)
       const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+      // Use fast prop_keys WHERE for export when possible
+      const fastWhere = buildFastCountWhere(db, ds.id, terms, propertyFilters)
+      const exportWhere = fastWhere ? fastWhere.where : where
+      const exportWhereParams = fastWhere ? fastWhere.params : params
 
       // Only extract the columns we need (plus sort column if sorting)
       const jsonExtracts = columns.map(c => `json_extract(data, ?) as [${c}]`).join(', ')
@@ -1244,9 +1333,9 @@ export function exportRecords(
         orderParams.push(`$.${sortColumn}`)
       }
 
-      const sql = `SELECT idx, ${jsonExtracts}${sortExtract} FROM records ${where} ${orderBy}`
+      const sql = `SELECT idx, ${jsonExtracts}${sortExtract} FROM records ${exportWhere} ${orderBy}`
       const rows = db.prepare(sql).all(
-        ...jsonParams, ...(sortExtract ? [orderParams[0]] : []), ...params,
+        ...jsonParams, ...(sortExtract ? [orderParams[0]] : []), ...exportWhereParams,
         ...(hasSort ? [orderParams[orderParams.length - 1]] : []),
       ) as Record<string, unknown>[]
 
