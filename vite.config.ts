@@ -203,6 +203,21 @@ function sqliteApiPlugin(): Plugin {
             return
           }
 
+          // ── POST /api/db/chart-data (aggregate data for charts)
+          if (pathname === '/api/db/chart-data' && req.method === 'POST') {
+            const body = (await parseJsonBody(req)) as {
+              datasets: { id: string; offset: number; count: number }[]
+              query: string
+              propertyFilters: string[]
+              columns: string[]
+            }
+            const result = db.aggregateChartData(
+              body.datasets, body.query, body.propertyFilters, body.columns,
+            )
+            sendJson(res, result)
+            return
+          }
+
           // Unknown route
           sendJson(res, { error: 'Not found' }, 404)
         } catch (err) {

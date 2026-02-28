@@ -578,6 +578,236 @@ export function getRecordCount(id: string): number {
   }
 }
 
+// ── Chart data aggregation ──
+
+export interface ColumnStats {
+  key: string
+  type: 'numeric' | 'categorical' | 'mixed'
+  totalNonNull: number
+  /** Numeric stats (only for numeric/mixed types) */
+  numeric?: {
+    min: number
+    max: number
+    avg: number
+    sum: number
+    count: number
+    histogram: { bucket: string; count: number }[]
+  }
+  /** Top value counts for categorical display */
+  topValues: { value: string; count: number }[]
+}
+
+/**
+ * Aggregate chart data for selected columns across filtered/searched records.
+ *
+ * Strategy: extract all column values into a TEMP TABLE in a single pass
+ * (one json_extract per column per row), then run fast stats / GROUP BY /
+ * histogram queries on the temp table with zero JSON parsing overhead.
+ * This makes charting 1–2M records take seconds instead of minutes.
+ */
+export function aggregateChartData(
+  datasets: { id: string; offset: number; count: number }[],
+  query: string,
+  propertyFilters: string[],
+  columns: string[],
+  maxTopValues = 20,
+  histogramBuckets = 15,
+): { columns: ColumnStats[]; totalRecords: number; timeTaken: number } {
+  const start = performance.now()
+  const trimmedQuery = query.trim().toLowerCase()
+  const terms = trimmedQuery
+    ? trimmedQuery.split(',').map(t => t.trim()).filter(Boolean)
+    : []
+
+  // Per-column accumulators for multi-dataset merging
+  interface ColAccum {
+    totalNonNull: number
+    numericCount: number
+    numMin: number
+    numMax: number
+    numSum: number
+    valueCounts: Map<string, number>
+  }
+  const accums = new Map<string, ColAccum>()
+  for (const col of columns) {
+    accums.set(col, {
+      totalNonNull: 0, numericCount: 0,
+      numMin: Infinity, numMax: -Infinity, numSum: 0,
+      valueCounts: new Map(),
+    })
+  }
+  let totalRecords = 0
+
+  for (const ds of datasets) {
+    try {
+      const db = getDB(ds.id)
+      const { conditions, params } = buildWhereClause(db, terms, propertyFilters)
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+
+      // ── Step 1: Create temp table and extract all column values in ONE pass ──
+      const colDefs = columns.map((_, i) => `c${i}`).join(', ')
+      db.exec(`DROP TABLE IF EXISTS _chart_extract`)
+      db.exec(`CREATE TEMP TABLE _chart_extract (${columns.map((_, i) => `c${i}`).join(', ')})`)
+
+      // Single INSERT that does one json_extract per column per row
+      const jsonExtracts = columns.map((col, i) => `json_extract(data, ?)`).join(', ')
+      const jsonParams = columns.map(c => `$.${c}`)
+
+      db.prepare(
+        `INSERT INTO _chart_extract (${colDefs})
+         SELECT ${jsonExtracts} FROM records ${where}`,
+      ).run(...jsonParams, ...params)
+
+      // Get total inserted count
+      const countRow = db.prepare(
+        `SELECT COUNT(*) as cnt FROM _chart_extract`,
+      ).get() as { cnt: number }
+      totalRecords += countRow.cnt
+
+      // ── Step 2: Per-column aggregation on temp table (no JSON parsing) ──
+      for (let i = 0; i < columns.length; i++) {
+        const col = columns[i]
+        const acc = accums.get(col)!
+        const cName = `c${i}`
+
+        // Numeric stats in one fast query on extracted values
+        const stats = db.prepare(
+          `SELECT
+             COUNT(*) as non_null,
+             SUM(CASE WHEN typeof(${cName}) IN ('integer','real') THEN 1 ELSE 0 END) as num_count,
+             MIN(CASE WHEN typeof(${cName}) IN ('integer','real') THEN ${cName} END) as num_min,
+             MAX(CASE WHEN typeof(${cName}) IN ('integer','real') THEN ${cName} END) as num_max,
+             SUM(CASE WHEN typeof(${cName}) IN ('integer','real') THEN CAST(${cName} AS REAL) ELSE 0 END) as num_sum
+           FROM _chart_extract
+           WHERE ${cName} IS NOT NULL AND ${cName} != ''`,
+        ).get() as {
+          non_null: number; num_count: number
+          num_min: number | null; num_max: number | null; num_sum: number
+        }
+
+        acc.totalNonNull += stats.non_null
+        acc.numericCount += stats.num_count
+        if (stats.num_min !== null && stats.num_min < acc.numMin) acc.numMin = stats.num_min
+        if (stats.num_max !== null && stats.num_max > acc.numMax) acc.numMax = stats.num_max
+        acc.numSum += stats.num_sum
+
+        // Top value distribution via GROUP BY on extracted column
+        const topRows = db.prepare(
+          `SELECT CAST(${cName} AS TEXT) as val, COUNT(*) as cnt
+           FROM _chart_extract
+           WHERE ${cName} IS NOT NULL AND ${cName} != ''
+           GROUP BY val ORDER BY cnt DESC LIMIT ?`,
+        ).all(maxTopValues + 10) as { val: string; cnt: number }[]
+
+        for (const row of topRows) {
+          if (row.val === null) continue
+          acc.valueCounts.set(row.val, (acc.valueCounts.get(row.val) || 0) + row.cnt)
+        }
+      }
+
+      // Clean up temp table
+      db.exec(`DROP TABLE IF EXISTS _chart_extract`)
+    } catch (err) {
+      console.error(`[SQLite] Chart aggregation error on dataset ${ds.id}:`, err)
+    }
+  }
+
+  // ── Step 3: Build final stats per column ──
+  const result: ColumnStats[] = []
+
+  for (const col of columns) {
+    const acc = accums.get(col)!
+    const isNumeric = acc.numericCount > acc.totalNonNull * 0.7
+    const type: ColumnStats['type'] = isNumeric
+      ? (acc.numericCount === acc.totalNonNull ? 'numeric' : 'mixed')
+      : 'categorical'
+
+    const sortedValues = [...acc.valueCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, maxTopValues)
+      .map(([value, count]) => ({ value, count }))
+
+    const stats: ColumnStats = {
+      key: col,
+      type,
+      totalNonNull: acc.totalNonNull,
+      topValues: sortedValues,
+    }
+
+    // Numeric histogram (needs a second mini temp table for this column)
+    if (acc.numericCount > 0 && acc.numMin !== Infinity) {
+      const min = acc.numMin
+      const max = acc.numMax
+      const avg = acc.numSum / acc.numericCount
+      const histogram: { bucket: string; count: number }[] = []
+
+      if (max > min) {
+        const bucketSize = (max - min) / histogramBuckets
+        const bucketCounts = new Array(histogramBuckets).fill(0)
+
+        // Re-extract only this numeric column for histogram bucketing
+        for (const ds of datasets) {
+          try {
+            const db = getDB(ds.id)
+            const { conditions, params } = buildWhereClause(db, terms, propertyFilters)
+            const jsonPath = `$.${col}`
+
+            // Build WHERE that includes search/filter + numeric type check
+            const numericCond = `typeof(json_extract(data, ?)) IN ('integer','real')`
+            const histWhere = conditions.length > 0
+              ? `WHERE ${conditions.join(' AND ')} AND ${numericCond}`
+              : `WHERE ${numericCond}`
+
+            // Extract numeric values into a minimal temp table
+            db.exec(`DROP TABLE IF EXISTS _hist_vals`)
+            db.exec(`CREATE TEMP TABLE _hist_vals (v REAL)`)
+            db.prepare(
+              `INSERT INTO _hist_vals (v)
+               SELECT CAST(json_extract(data, ?) AS REAL)
+               FROM records ${histWhere}`,
+            ).run(jsonPath, ...params, jsonPath)
+
+            // Bucket via integer division on the temp table
+            const rows = db.prepare(
+              `SELECT
+                 MIN(CAST((v - ?) / ? AS INTEGER), ?) as bucket,
+                 COUNT(*) as cnt
+               FROM _hist_vals
+               GROUP BY bucket`,
+            ).all(min, bucketSize, histogramBuckets - 1) as { bucket: number; cnt: number }[]
+
+            for (const row of rows) {
+              const idx = Math.max(0, Math.min(row.bucket, histogramBuckets - 1))
+              bucketCounts[idx] += row.cnt
+            }
+
+            db.exec(`DROP TABLE IF EXISTS _hist_vals`)
+          } catch {
+            // skip histogram for this dataset on error
+          }
+        }
+
+        for (let i = 0; i < histogramBuckets; i++) {
+          const lo = min + i * bucketSize
+          const hi = lo + bucketSize
+          histogram.push({
+            bucket: `${lo.toFixed(1)} – ${hi.toFixed(1)}`,
+            count: bucketCounts[i],
+          })
+        }
+      } else {
+        histogram.push({ bucket: String(min), count: acc.numericCount })
+      }
+
+      stats.numeric = { min, max, avg, sum: acc.numSum, count: acc.numericCount, histogram }
+    }
+
+    result.push(stats)
+  }
+
+  return { columns: result, totalRecords, timeTaken: performance.now() - start }
+}
+
 // ── Server-side paginated query ──
 
 export interface QueryResult {

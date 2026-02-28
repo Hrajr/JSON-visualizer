@@ -148,6 +148,43 @@ export async function searchRecords(
   return res.json()
 }
 
+// ── Server API: Chart data aggregation ──
+
+export interface ColumnStats {
+  key: string
+  type: 'numeric' | 'categorical' | 'mixed'
+  totalNonNull: number
+  numeric?: {
+    min: number
+    max: number
+    avg: number
+    sum: number
+    count: number
+    histogram: { bucket: string; count: number }[]
+  }
+  topValues: { value: string; count: number }[]
+}
+
+export interface ChartDataResult {
+  columns: ColumnStats[]
+  totalRecords: number
+  timeTaken: number
+}
+
+export async function fetchChartData(
+  datasets: { id: string; offset: number; count: number }[],
+  query: string,
+  propertyFilters: string[],
+  columns: string[],
+): Promise<ChartDataResult> {
+  const res = await fetch('/api/db/chart-data', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ datasets, query, propertyFilters, columns }),
+  })
+  return res.json()
+}
+
 export async function sortRecords(
   datasets: { id: string; offset: number; count: number }[],
   column: string,

@@ -22,6 +22,7 @@ import RowDrawer from './components/RowDrawer.vue'
 import LoadingFooter from './components/LoadingFooter.vue'
 import DatasetManager from './components/DatasetManager.vue'
 import FilterModal from './components/FilterModal.vue'
+import ChartModal from './components/ChartModal.vue'
 
 import { useParser } from './composables/useParser'
 import { useDatasets } from './composables/useDatasets'
@@ -137,6 +138,9 @@ const selectedRecord = ref<JsonRecord | null>(null)
 
 // ── Filter modal ──
 const filterModalOpen = ref(false)
+
+// ── Chart modal ──
+const chartModalOpen = ref(false)
 
 const allKeysList = computed(() => Array.from(displayKeys.value.keys()))
 
@@ -408,6 +412,19 @@ onBeforeUnmount(() => {
 
         <!-- Right: Action buttons -->
         <div class="flex items-center gap-0.5 shrink-0">
+          <!-- Charts button -->
+          <button
+            v-if="isDataReady"
+            class="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
+            title="Charts & Diagrams"
+            @click="chartModalOpen = true"
+          >
+            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+            </svg>
+            <span class="hidden sm:inline">Charts</span>
+          </button>
+
           <!-- Filter button -->
           <button
             v-if="isDataReady"
@@ -650,6 +667,17 @@ onBeforeUnmount(() => {
       :selected-keys="propertyFilters"
       @update:selected-keys="propertyFilters = $event"
       @close="filterModalOpen = false"
+    />
+
+    <!-- Chart modal -->
+    <ChartModal
+      :open="chartModalOpen"
+      :all-keys="allKeysList"
+      :search-query="searchQuery"
+      :property-filters="propertyFilters"
+      :dataset-ranges="effectiveRanges"
+      :match-count="matchCount"
+      @close="chartModalOpen = false"
     />
   </div>
 </template>
